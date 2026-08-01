@@ -40,8 +40,8 @@ jobs:
         run: |
           $version = node -p "require('./package.json').version"
           $tag = "v$version"
-          gh release view $tag --repo $env:GITHUB_REPOSITORY *> $null
-          $exists = $LASTEXITCODE -eq 0
+          $releases = gh release list --repo $env:GITHUB_REPOSITORY --limit 100 --json tagName | ConvertFrom-Json
+          $exists = $releases.tagName -contains $tag
           "version=$version" >> $env:GITHUB_OUTPUT
           "tag=$tag" >> $env:GITHUB_OUTPUT
           "required=$(-not $exists)".ToLowerInvariant() >> $env:GITHUB_OUTPUT
