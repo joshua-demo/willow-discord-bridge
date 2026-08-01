@@ -114,12 +114,6 @@ fn open_url(url: String) -> Result<(), String> {
     }
 }
 
-#[tauri::command]
-fn quit_app(app: AppHandle, state: State<'_, AppState>) {
-    let _ = state.discord_tx.send(DiscordCommand::Shutdown);
-    app.exit(0);
-}
-
 fn set_autostart(app: &AppHandle, enabled: bool) {
     let autostart = app.autolaunch();
     let _ = if enabled {
@@ -153,9 +147,13 @@ fn config_path(app: &AppHandle) -> PathBuf {
         .join("config.json")
 }
 
+fn should_prevent_exit(code: Option<i32>) -> bool {
+    code.is_none()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _, _| {
             let _ = show_settings(app);
         }))
@@ -239,8 +237,32 @@ pub fn run() {
             reconnect_discord,
             capture_shortcut,
             open_url,
-            quit_app,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running Willow Discord Bridge");
+        .build(tauri::generate_context!())
+        .expect("error while building Willow Discord Bridge");
+
+    app.run(|_, event| {
+        if let tauri::RunEvent::ExitRequested { api, code, .. } = event {
+            // Destroying the settings webview must leave the tray bridge alive.
+            // Explicit exits (the tray Quit item) carry a code and are allowed.
+            if should_prevent_exit(code) {
+                api.prevent_exit();
+            }
+        }
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_prevent_exit;
+
+    #[test]
+    fn closing_the_last_window_keeps_the_tray_process_alive() {
+        assert!(should_prevent_exit(None));
+    }
+
+    #[test]
+    fn explicit_quit_is_allowed_to_exit() {
+        assert!(!should_prevent_exit(Some(0)));
+    }
 }

@@ -49,7 +49,6 @@ const elements = {
   delayValue: $('delay-value'),
   launchAtLogin: $<HTMLInputElement>('launch-at-login'),
   save: $<HTMLButtonElement>('save'),
-  quit: $<HTMLButtonElement>('quit'),
   error: $('error'),
   version: $('version'),
 };
@@ -161,7 +160,6 @@ elements.connect.addEventListener('click', async () => {
 });
 elements.setupHelp.addEventListener('click', () => { elements.setupSteps.hidden = !elements.setupSteps.hidden; });
 elements.openPortal.addEventListener('click', () => invoke('open_url', { url: 'https://discord.com/developers/applications' }));
-elements.quit.addEventListener('click', () => invoke('quit_app'));
 
 (async () => {
   config = await invoke<Config>('get_config');

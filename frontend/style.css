@@ -100,8 +100,6 @@ button { font: inherit; cursor: pointer; border: none; border-radius: var(--radi
 }
 .primary:hover { background: #9c8fff; }
 .primary:disabled { opacity: .5; cursor: default; }
-.quit { background: transparent; color: var(--muted); padding: 10px 16px; font-size: 12.5px; }
-.quit:hover { color: var(--live); }
 
 .capture {
   background: var(--surface2); border: 1px solid var(--border);

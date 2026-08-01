@@ -12,6 +12,7 @@ A tiny Tauri notification-area app that self-mutes Discord while Willow Voice is
 
 ## Features
 
+- Close settings without stopping the bridge; it keeps running in the notification area until **Quit** is selected from the tray menu.
 - **Hold Ctrl + Windows:** mute Discord until the shortcut is released.
 - **Double-tap Ctrl + Windows:** keep Discord muted during Willow's locked mode.
 - **Tap once while locked:** stop locked mode and restore Discord's prior voice state.
@@ -77,7 +78,7 @@ npm run dist
 
 Output:
 
-`src-tauri\target\release\bundle\nsis\Willow Discord Bridge_0.3.0_x64-setup.exe`
+`src-tauri\target\release\bundle\nsis\Willow Discord Bridge_<version>_x64-setup.exe`
 
 The installer is currently unsigned, so Windows SmartScreen may display a warning.
 

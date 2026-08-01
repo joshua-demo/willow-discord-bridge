@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Willow Discord Bridge",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "identifier": "com.willowdiscordbridge.desktop",
   "build": {
     "beforeBuildCommand": "npm run build",
@@ -16,7 +16,9 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["nsis"],
+    "targets": [
+      "nsis"
+    ],
     "icon": [
       "../assets/icon.ico",
       "../assets/generated/icon-256.png"
