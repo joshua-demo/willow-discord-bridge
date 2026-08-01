@@ -18,7 +18,7 @@
     "@types/node": "^24.0.0",
     "electron": "^43.2.0",
     "electron-builder": "^26.15.3",
-    "typescript": "^5.9.0",
+    "typescript": "^7.0.2",
     "vitest": "^1.6.1"
   },
   "dependencies": {
@@ -51,7 +51,9 @@
       "target": [
         {
           "target": "nsis",
-          "arch": ["x64"]
+          "arch": [
+            "x64"
+          ]
         }
       ],
       "icon": "assets/icon.ico",

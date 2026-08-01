@@ -82,6 +82,17 @@ Output:
 
 The build is currently unsigned, so Windows SmartScreen may display a warning.
 
+## CI and automatic releases
+
+GitHub Actions tests and builds every push to `main` and every pull request using the native Go-based TypeScript 7 compiler. When `package.json` contains a version that does not yet have a matching GitHub release, a successful push to `main` automatically:
+
+1. builds the Windows installer;
+2. creates the corresponding `v<version>` Git tag at that commit;
+3. creates a GitHub Release with generated release notes; and
+4. uploads the installer to that release.
+
+Create the next release with `npm version patch`, `npm version minor`, or `npm version major`, then push the commit to `main`. Pushing more commits without changing the version runs only the fast CI path and does not duplicate the release.
+
 ## Limits
 
 - Willow has no public recording-state event, so synchronization is based on the shared physical shortcut and its gestures.

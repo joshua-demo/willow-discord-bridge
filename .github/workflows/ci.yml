@@ -1,4 +1,4 @@
-name: CI
+name: CI and Release
 
 on:
   push:
@@ -6,47 +6,93 @@ on:
   pull_request:
 
 # A newer push makes an older run irrelevant. Cancelling it saves both time and
-# GitHub Actions minutes, especially when several commits are pushed quickly.
+# Actions minutes when several commits are pushed quickly.
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  group: ci-release-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# Pull requests from forks receive a read-only token. Release creation is also
+# explicitly restricted to pushes on main by the release-check condition below.
 permissions:
-  contents: read
+  contents: write
 
 env:
   CI: true
   NPM_CONFIG_AUDIT: false
   NPM_CONFIG_FUND: false
   NPM_CONFIG_PREFER_OFFLINE: true
+  GH_TOKEN: ${{ github.token }}
 
 jobs:
-  test:
+  test-and-release:
     runs-on: windows-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
-      # cache: npm caches downloaded package tarballs using package-lock.json.
-      # It deliberately does not cache node_modules, which npm ci deletes and
-      # which is slower to transfer than recreating for this small project.
+      # A package version is released once. Ordinary pushes and pull requests use
+      # the lightweight CI install; a new version uses the full Electron install
+      # and continues through packaging and release in this same runner.
+      - name: Check whether this version needs a release
+        id: release-check
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        shell: pwsh
+        run: |
+          $version = node -p "require('./package.json').version"
+          $tag = "v$version"
+          gh release view $tag --repo $env:GITHUB_REPOSITORY *> $null
+          $exists = $LASTEXITCODE -eq 0
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          "required=$(-not $exists)".ToLowerInvariant() >> $env:GITHUB_OUTPUT
+
       - uses: actions/setup-node@v4
         with:
           node-version: 24
           cache: npm
           cache-dependency-path: package-lock.json
 
-      # CI only type-checks/tests source; it does not launch or package Electron.
-      # Skipping postinstall avoids rebuilding native modules and downloading the
-      # Electron runtime. uiohook-napi's checked-in N-API prebuild is sufficient
-      # for the unit tests.
-      - name: Install dependencies
+      # setup-node caches npm tarballs. These additional caches avoid downloading
+      # the large Electron runtime and NSIS toolchain again on later releases.
+      - name: Cache Electron packaging downloads
+        if: steps.release-check.outputs.required == 'true'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~\AppData\Local\electron\Cache
+            ~\AppData\Local\electron-builder\Cache
+          key: electron-windows-${{ hashFiles('package-lock.json') }}
+          restore-keys: electron-windows-
+
+      - name: Install dependencies for CI
+        if: steps.release-check.outputs.required != 'true'
         run: npm ci --ignore-scripts
+
+      - name: Install dependencies for release
+        if: steps.release-check.outputs.required == 'true'
+        run: npm ci
 
       - name: Test
         run: npm test
 
-      # tsc emits the app and performs the same type-check as `tsc --noEmit`, so
-      # running the separate typecheck script here would duplicate all TS work.
+      # tsc emits the app and performs the same type-check as `tsc --noEmit`.
       - name: Type-check and build
         run: npm run build
+
+      - name: Package Windows installer
+        if: steps.release-check.outputs.required == 'true'
+        run: npx electron-builder --win --publish never
+
+      # gh release create also creates the v<version> tag at this exact commit.
+      - name: Create GitHub release
+        if: steps.release-check.outputs.required == 'true'
+        shell: pwsh
+        run: |
+          $version = '${{ steps.release-check.outputs.version }}'
+          $tag = '${{ steps.release-check.outputs.tag }}'
+          $installer = "release/Willow-Discord-Bridge-$version-Setup.exe"
+          gh release create $tag $installer `
+            --repo $env:GITHUB_REPOSITORY `
+            --target $env:GITHUB_SHA `
+            --title "Willow Discord Bridge $version" `
+            --generate-notes
