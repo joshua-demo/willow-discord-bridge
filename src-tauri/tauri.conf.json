@@ -1,0 +1,30 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Willow Discord Bridge",
+  "version": "0.3.0",
+  "identifier": "com.willowdiscordbridge.desktop",
+  "build": {
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../frontend-dist"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [],
+    "security": {
+      "csp": "default-src 'self'; img-src 'self' asset: data:; style-src 'self'; script-src 'self'"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis"],
+    "icon": [
+      "../assets/icon.ico",
+      "../assets/generated/icon-256.png"
+    ],
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser"
+      }
+    }
+  }
+}

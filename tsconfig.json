@@ -1,19 +1,17 @@
 {
   "compilerOptions": {
-    "target": "ES2020",
+    "target": "ES2022",
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
-    "lib": ["ES2020", "DOM"],
-    "outDir": "dist",
-    "rootDir": "src",
+    "lib": ["ES2022", "DOM"],
+    "outDir": "frontend-dist",
+    "rootDir": "frontend",
     "strict": true,
-    "esModuleInterop": true,
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true,
-    "resolveJsonModule": true,
     "sourceMap": false,
     "declaration": false
   },
-  "include": ["src/**/*"],
-  "exclude": ["node_modules", "dist", "tests"]
+  "include": ["frontend/**/*.ts"],
+  "exclude": ["node_modules", "frontend-dist"]
 }

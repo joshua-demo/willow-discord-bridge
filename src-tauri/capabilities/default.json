@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Permissions for the local settings window",
+  "windows": ["settings"],
+  "permissions": ["core:default"]
+}

@@ -15,9 +15,10 @@ approach, and portions of the associated tests were adapted from that project.
 The original MIT License and copyright notice are retained verbatim in LICENSE.
 The upstream README is preserved in UPSTREAM_README.md for additional provenance.
 
-This repository's Windows-specific adaptation includes a Windows tray lifecycle,
-Ctrl+Windows shortcut handling for Willow Voice, a Windows settings interface,
-Windows DPAPI protection for credentials, Windows packaging, and related tests.
+This repository's Windows-specific adaptation includes a Rust/Tauri tray
+lifecycle, a native Win32 low-level keyboard hook for Willow Voice shortcuts,
+direct Discord named-pipe RPC and OAuth, Windows DPAPI credential protection,
+a WebView2 settings interface, Windows packaging, and related tests.
 
 Willow Voice and Discord are trademarks of their respective owners. This is an
 unofficial community project and is not affiliated with or endorsed by either.
