@@ -5,19 +5,48 @@ on:
     branches: [main]
   pull_request:
 
+# A newer push makes an older run irrelevant. Cancelling it saves both time and
+# GitHub Actions minutes, especially when several commits are pushed quickly.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
+
+env:
+  CI: true
+  NPM_CONFIG_AUDIT: false
+  NPM_CONFIG_FUND: false
+  NPM_CONFIG_PREFER_OFFLINE: true
 
 jobs:
   test:
     runs-on: windows-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+
+      # cache: npm caches downloaded package tarballs using package-lock.json.
+      # It deliberately does not cache node_modules, which npm ci deletes and
+      # which is slower to transfer than recreating for this small project.
       - uses: actions/setup-node@v4
         with:
           node-version: 24
           cache: npm
-      - run: npm ci
-      - run: npm test
-      - run: npm run typecheck
-      - run: npm run build
+          cache-dependency-path: package-lock.json
+
+      # CI only type-checks/tests source; it does not launch or package Electron.
+      # Skipping postinstall avoids rebuilding native modules and downloading the
+      # Electron runtime. uiohook-napi's checked-in N-API prebuild is sufficient
+      # for the unit tests.
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Test
+        run: npm test
+
+      # tsc emits the app and performs the same type-check as `tsc --noEmit`, so
+      # running the separate typecheck script here would duplicate all TS work.
+      - name: Type-check and build
+        run: npm run build
