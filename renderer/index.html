@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' data: file:; style-src 'self'; script-src 'self';" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Willow Discord Bridge</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header class="hero">
+    <img class="logo" src="../assets/icon.svg" alt="" />
+    <div class="hero-text">
+      <h1>Willow Discord Bridge</h1>
+      <p>Mute Discord while you dictate with Willow Voice.</p>
+    </div>
+    <div class="status" id="status">
+      <span class="dot" id="status-dot"></span>
+      <span id="status-label">Starting…</span>
+    </div>
+  </header>
+
+  <main>
+    <section class="card">
+      <div class="card-head">
+        <h2>Discord connection</h2>
+        <span id="rpc-state" class="pill pill-off">Not connected</span>
+      </div>
+      <p class="muted">The bridge controls self-mute through Discord desktop's local RPC connection. It does not simulate a keypress.</p>
+      <div class="field">
+        <label for="rpc-id">Discord application Client ID</label>
+        <input id="rpc-id" type="text" spellcheck="false" autocomplete="off" placeholder="123456789012345678" />
+      </div>
+      <div class="field">
+        <label for="rpc-secret">Discord application Client Secret</label>
+        <input id="rpc-secret" type="password" spellcheck="false" autocomplete="off" placeholder="Paste your client secret" />
+      </div>
+      <div class="row-actions">
+        <button class="primary" id="connect" type="button">Save and connect</button>
+        <button class="ghost" id="setup-help" type="button">Discord setup instructions</button>
+      </div>
+      <p class="err" id="rpc-error" hidden></p>
+      <div class="callout" id="setup-steps" hidden>
+        <ol>
+          <li>Create an application in the Discord Developer Portal.</li>
+          <li>Add your Discord account under <strong>App Testers</strong>.</li>
+          <li>Add the OAuth redirect URI <code>http://localhost</code>.</li>
+          <li>Paste the Client ID and Client Secret above, then approve the prompt in Discord desktop.</li>
+        </ol>
+        <button class="link-button" id="open-portal" type="button">Open Discord Developer Portal</button>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Willow shortcut</h2>
+      <p class="muted">Set this to the exact same shortcut used by Willow Voice. The default is <strong>Ctrl + Windows</strong>.</p>
+      <div class="binding">
+        <div class="binding-label">
+          <strong>Dictation shortcut</strong>
+          <span class="muted">Click the button, then press and release the shortcut</span>
+        </div>
+        <button class="capture" id="capture-shortcut" type="button">Ctrl + Win</button>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Behavior</h2>
+      <div class="binding">
+        <div class="binding-label">
+          <strong>Shortcut mode</strong>
+          <span class="muted">Auto mirrors Willow: hold to dictate, double-tap to lock, tap again to stop.</span>
+        </div>
+        <div class="segment" id="mode-segment">
+          <button type="button" data-mode="auto">Auto</button>
+          <button type="button" data-mode="hold">Hold only</button>
+          <button type="button" data-mode="toggle">Toggle</button>
+        </div>
+      </div>
+      <div class="binding">
+        <div class="binding-label">
+          <strong>Unmute delay</strong>
+          <span class="muted"><span id="delay-value">0</span> ms after dictation stops</span>
+        </div>
+        <input id="delay" type="range" min="0" max="500" step="50" value="0" />
+      </div>
+      <div class="perm-row">
+        <span><strong>Start with Windows</strong><span class="muted"> — run quietly in the notification area</span></span>
+        <input id="launch-at-login" type="checkbox" />
+      </div>
+    </section>
+
+    <div class="callout">
+      <strong>How locked mode works:</strong> the bridge observes the same physical shortcut as Willow. It does not read your speech, audio, or typed text. Because Willow has no public recording-state API, both apps must use the same shortcut and gesture.
+    </div>
+
+    <p class="err" id="error"></p>
+    <div class="actions">
+      <button class="quit" id="quit" type="button">Quit bridge</button>
+      <button class="primary" id="save" type="button">Save settings</button>
+    </div>
+    <p class="version" id="version"></p>
+  </main>
+  <script src="renderer.js"></script>
+</body>
+</html>

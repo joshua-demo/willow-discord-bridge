@@ -1,0 +1,66 @@
+{
+  "name": "willow-discord-bridge",
+  "version": "0.2.0",
+  "description": "Windows tray app that mutes Discord while Willow Voice is dictating",
+  "author": "Willow Discord Bridge contributors",
+  "license": "MIT",
+  "main": "dist/main.js",
+  "scripts": {
+    "postinstall": "electron-builder install-app-deps",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "build": "tsc",
+    "start": "npm run build && electron .",
+    "dist": "npm run dist:win",
+    "dist:win": "npm run build && electron-builder --win --publish never"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "electron": "^43.2.0",
+    "electron-builder": "^26.15.3",
+    "typescript": "^5.9.0",
+    "vitest": "^1.6.1"
+  },
+  "dependencies": {
+    "discord-rpc": "^4.0.1",
+    "electron-store": "^8.2.0",
+    "uiohook-napi": "^1.5.5"
+  },
+  "overrides": {
+    "fast-uri": "3.1.4"
+  },
+  "build": {
+    "appId": "com.willowdiscordbridge.app",
+    "productName": "Willow Discord Bridge",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "renderer/**/*",
+      "assets/**/*",
+      "package.json",
+      "LICENSE",
+      "NOTICE"
+    ],
+    "asarUnpack": [
+      "**/*.node",
+      "node_modules/uiohook-napi/**"
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": ["x64"]
+        }
+      ],
+      "icon": "assets/icon.ico",
+      "artifactName": "Willow-Discord-Bridge-${version}-Setup.exe"
+    },
+    "nsis": {
+      "oneClick": true,
+      "perMachine": false,
+      "deleteAppDataOnUninstall": false
+    }
+  }
+}
