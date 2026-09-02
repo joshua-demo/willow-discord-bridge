@@ -1,6 +1,6 @@
 [package]
 name = "willow-discord-bridge"
-version = "0.3.1"
+version = "0.3.2"
 description = "Tiny Windows tray bridge between Willow Voice and Discord"
 authors = ["Willow Discord Bridge contributors"]
 license = "MIT"
