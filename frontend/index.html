@@ -43,7 +43,7 @@
       <div class="callout" id="setup-steps" hidden>
         <ol>
           <li>Create an application in the Discord Developer Portal.</li>
-          <li>Add your Discord account under <strong>App Testers</strong>.</li>
+          <li>Add the exact Discord account signed in to the desktop app under <strong>App Testers</strong>. Discord rejects the required RPC voice scope for other accounts.</li>
           <li>Add the OAuth redirect URI <code>http://localhost</code>.</li>
           <li>Paste the Client ID and Client Secret above, then approve the prompt in Discord desktop.</li>
         </ol>
@@ -84,8 +84,12 @@
         <input id="delay" type="range" min="0" max="500" step="50" value="0" />
       </div>
       <div class="perm-row">
+        <span><strong>Deafen while dictating</strong><span class="muted"> — also block incoming Discord audio</span></span>
+        <input class="toggle-switch" id="deafen-while-active" type="checkbox" role="switch" aria-label="Deafen while dictating" />
+      </div>
+      <div class="perm-row">
         <span><strong>Start with Windows</strong><span class="muted"> — run quietly in the notification area</span></span>
-        <input id="launch-at-login" type="checkbox" />
+        <input class="toggle-switch" id="launch-at-login" type="checkbox" role="switch" aria-label="Start with Windows" />
       </div>
     </section>
 
@@ -94,10 +98,6 @@
     </div>
 
     <p class="err" id="error"></p>
-    <div class="actions">
-      <span class="muted">Close this window to keep the bridge running in the notification area.</span>
-      <button class="primary" id="save" type="button">Save settings</button>
-    </div>
     <p class="version" id="version"></p>
   </main>
   <script type="module" src="renderer.js"></script>

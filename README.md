@@ -1,6 +1,6 @@
 # Willow Discord Bridge for Windows
 
-A tiny Tauri notification-area app that self-mutes Discord while Willow Voice is listening.
+A tiny Tauri notification-area app that self-mutes—and optionally self-deafens—Discord while Willow Voice is listening.
 
 > **Attribution:** This project adapts the Discord RPC and shortcut-gesture work
 > pioneered in [Hush](https://github.com/MatthysDev/hush) by
@@ -16,8 +16,9 @@ A tiny Tauri notification-area app that self-mutes Discord while Willow Voice is
 - **Hold Ctrl + Windows:** mute Discord until the shortcut is released.
 - **Double-tap Ctrl + Windows:** keep Discord muted during Willow's locked mode.
 - **Tap once while locked:** stop locked mode and restore Discord's prior voice state.
+- Optionally self-deafen Discord too, blocking incoming audio while dictating.
 - Preserve a pre-existing Discord mute/deafen state instead of blindly unmuting.
-- Configurable shortcut, gesture mode, unmute delay, and start-with-Windows.
+- Configurable shortcut, gesture mode, deafen behavior, unmute delay, and start-with-Windows.
 - Encrypt Discord credentials and OAuth tokens with Windows DPAPI.
 - Direct Discord local RPC—no simulated Discord keypresses or internet-facing server.
 
@@ -51,7 +52,7 @@ The tray process starts without a webview. Tauri creates the settings webview on
 ## Discord RPC setup
 
 1. Go to <https://discord.com/developers/applications> and create an application.
-2. Add your Discord account under **App Testers** while the application is unapproved.
+2. Add the exact Discord account signed in to the desktop app under **App Testers** while the application is unapproved. Otherwise Discord returns `OAuth2 Error: invalid_scope` for the restricted RPC voice scope.
 3. Under **OAuth2**, copy the **Client ID** and generate/copy a **Client Secret**.
 4. Add the redirect URI exactly: `http://localhost`
 5. Open Willow Discord Bridge settings and paste both values.

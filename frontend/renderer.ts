@@ -6,6 +6,7 @@ type Config = {
   shortcut: Shortcut;
   discordRpc: DiscordConfig;
   mode: Mode;
+  deafenWhileActive: boolean;
   unmuteDelayMs: number;
   launchAtLogin: boolean;
 };
@@ -47,14 +48,16 @@ const elements = {
   modes: $('mode-segment'),
   delay: $<HTMLInputElement>('delay'),
   delayValue: $('delay-value'),
+  deafenWhileActive: $<HTMLInputElement>('deafen-while-active'),
   launchAtLogin: $<HTMLInputElement>('launch-at-login'),
-  save: $<HTMLButtonElement>('save'),
   error: $('error'),
   version: $('version'),
 };
 
 let config: Config;
 let capturing = false;
+let saveRevision = 0;
+let saveQueue = Promise.resolve();
 
 function comboLabel(combo: Shortcut): string {
   const parts = MOD_ORDER.filter((mod) => combo.mods.includes(mod)).map((mod) => MOD_LABEL[mod]);
@@ -72,6 +75,7 @@ function syncInputs(): void {
     clientSecret: elements.rpcSecret.value.trim(),
   };
   config.unmuteDelayMs = Number(elements.delay.value);
+  config.deafenWhileActive = elements.deafenWhileActive.checked;
   config.launchAtLogin = elements.launchAtLogin.checked;
 }
 
@@ -81,23 +85,32 @@ function render(): void {
   elements.capture.textContent = comboLabel(config.shortcut);
   elements.delay.value = String(config.unmuteDelayMs);
   elements.delayValue.textContent = String(config.unmuteDelayMs);
+  elements.deafenWhileActive.checked = config.deafenWhileActive;
   elements.launchAtLogin.checked = config.launchAtLogin;
   for (const button of elements.modes.querySelectorAll<HTMLButtonElement>('button')) {
     button.classList.toggle('active', button.dataset.mode === config.mode);
   }
 }
 
-async function save(): Promise<boolean> {
+function save(): Promise<boolean> {
   syncInputs();
   showError();
-  const result = await invoke<SaveResult>('save_config', { config });
-  if (!result.ok) {
-    showError(result.error);
-    return false;
-  }
-  config = result.config;
-  render();
-  return true;
+  const snapshot = structuredClone(config);
+  const revision = ++saveRevision;
+  const task = saveQueue.then(async () => {
+    const result = await invoke<SaveResult>('save_config', { config: snapshot });
+    if (!result.ok) {
+      if (revision === saveRevision) showError(result.error);
+      return false;
+    }
+    if (revision === saveRevision) {
+      config = result.config;
+      render();
+    }
+    return true;
+  });
+  saveQueue = task.then(() => undefined, () => undefined);
+  return task;
 }
 
 function renderStatus(status: Status): void {
@@ -105,7 +118,9 @@ function renderStatus(status: Status): void {
     elements.statusLabel.textContent = 'Shortcut listener unavailable';
     elements.statusDot.className = 'dot warn';
   } else if (status.active) {
-    elements.statusLabel.textContent = 'Discord muted — Willow is listening';
+    elements.statusLabel.textContent = config.deafenWhileActive
+      ? 'Discord muted and deafened — Willow is listening'
+      : 'Discord muted — Willow is listening';
     elements.statusDot.className = 'dot active';
   } else {
     elements.statusLabel.textContent = 'Ready';
@@ -143,15 +158,13 @@ elements.modes.addEventListener('click', (event) => {
   if (!target.dataset.mode) return;
   config.mode = target.dataset.mode as Mode;
   render();
+  void save();
 });
 
 elements.delay.addEventListener('input', () => { elements.delayValue.textContent = elements.delay.value; });
-elements.save.addEventListener('click', async () => {
-  if (await save()) {
-    elements.save.textContent = 'Saved';
-    setTimeout(() => { elements.save.textContent = 'Save settings'; }, 1200);
-  }
-});
+elements.delay.addEventListener('change', () => { void save(); });
+elements.deafenWhileActive.addEventListener('change', () => { void save(); });
+elements.launchAtLogin.addEventListener('change', () => { void save(); });
 elements.connect.addEventListener('click', async () => {
   if (!await save()) return;
   elements.connect.textContent = 'Connecting…';

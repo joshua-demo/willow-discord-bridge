@@ -40,6 +40,7 @@ impl Default for BridgeStatus {
 pub enum DiscordCommand {
     Connect,
     SetMute(bool),
+    RefreshActive,
     Shutdown,
 }
 
@@ -78,7 +79,7 @@ pub fn start_worker(
                                 prior = rpc.get_voice_settings().ok();
                                 owns_mute = true;
                             }
-                            rpc.set_voice_settings(true, None)
+                            set_active_voice(rpc, prior, store.get().deafen_while_active)
                         } else {
                             if !owns_mute {
                                 continue;
@@ -90,6 +91,20 @@ pub fn start_worker(
                             }
                         };
                         if let Err(error) = result {
+                            client = None;
+                            prior = None;
+                            owns_mute = false;
+                            set_rpc_status(&status, RpcState::Disconnected, Some(error));
+                        }
+                    }
+                    DiscordCommand::RefreshActive => {
+                        if !owns_mute {
+                            continue;
+                        }
+                        let Some(rpc) = client.as_mut() else { continue };
+                        if let Err(error) =
+                            set_active_voice(rpc, prior, store.get().deafen_while_active)
+                        {
                             client = None;
                             prior = None;
                             owns_mute = false;
@@ -109,6 +124,19 @@ pub fn start_worker(
         })
         .expect("failed to start Discord worker");
     tx
+}
+
+fn set_active_voice(
+    rpc: &mut RpcClient,
+    prior: Option<VoiceState>,
+    deafen_while_active: bool,
+) -> Result<(), String> {
+    let deaf = if deafen_while_active {
+        Some(true)
+    } else {
+        prior.map(|state| state.deaf)
+    };
+    rpc.set_voice_settings(true, deaf)
 }
 
 fn set_rpc_status(status: &Mutex<BridgeStatus>, rpc: RpcState, error: Option<String>) {
@@ -173,11 +201,7 @@ impl RpcClient {
                 continue;
             }
             if payload.get("evt").and_then(Value::as_str) == Some("ERROR") {
-                let message = payload
-                    .pointer("/data/message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("Discord RPC error");
-                return Err(message.into());
+                return Err(rpc_error_message(&payload));
             }
             return Ok(payload.get("data").cloned().unwrap_or(Value::Null));
         }
@@ -327,9 +351,47 @@ fn exchange_token(
         .map_err(|error| error.to_string())
 }
 
+fn rpc_error_message(payload: &Value) -> String {
+    let message = payload
+        .pointer("/data/message")
+        .and_then(Value::as_str)
+        .unwrap_or("Discord RPC error");
+    let code = payload.pointer("/data/code").and_then(Value::as_i64);
+    if code == Some(5000) && message.contains("invalid_scope") {
+        return format!(
+            "{message} Add the Discord account currently signed in to this application's App Testers list in the Developer Portal, then try again."
+        );
+    }
+    message.into()
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or(Duration::ZERO)
         .as_millis() as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invalid_scope_error_explains_app_testers_requirement() {
+        let payload = json!({
+            "data": {
+                "code": 5000,
+                "message": "OAuth2 Error: invalid_scope: The requested scope is invalid"
+            }
+        });
+        let message = rpc_error_message(&payload);
+        assert!(message.contains("App Testers"));
+        assert!(message.contains("invalid_scope"));
+    }
+
+    #[test]
+    fn other_rpc_errors_are_unchanged() {
+        let payload = json!({ "data": { "code": 4006, "message": "Not authenticated" } });
+        assert_eq!(rpc_error_message(&payload), "Not authenticated");
+    }
 }

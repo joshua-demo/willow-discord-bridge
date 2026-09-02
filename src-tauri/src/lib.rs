@@ -63,6 +63,7 @@ fn save_config(app: AppHandle, state: State<'_, AppState>, config: Config) -> Sa
     match state.store.replace_public(config) {
         Ok(saved) => {
             set_autostart(&app, saved.launch_at_login);
+            let _ = state.discord_tx.send(DiscordCommand::RefreshActive);
             SaveResult {
                 ok: true,
                 config: Some(saved),

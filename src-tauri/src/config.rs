@@ -54,6 +54,8 @@ pub struct Config {
     pub shortcut: Shortcut,
     pub discord_rpc: DiscordRpc,
     pub mode: Mode,
+    #[serde(default)]
+    pub deafen_while_active: bool,
     pub unmute_delay_ms: u64,
     pub launch_at_login: bool,
 }
@@ -67,6 +69,7 @@ impl Default for Config {
             },
             discord_rpc: DiscordRpc::default(),
             mode: Mode::Auto,
+            deafen_while_active: false,
             unmute_delay_ms: 0,
             launch_at_login: true,
         }
@@ -267,5 +270,18 @@ mod tests {
         let encrypted = protect("secret-value").expect("encrypt");
         assert!(encrypted.starts_with("dpapi:"));
         assert_eq!(unprotect(&encrypted).as_deref(), Some("secret-value"));
+    }
+
+    #[test]
+    fn old_configs_default_deafen_to_off() {
+        let raw = r#"{
+            "shortcut": { "mods": ["ctrl"], "key": "" },
+            "discordRpc": { "clientId": "", "clientSecret": "" },
+            "mode": "hold",
+            "unmuteDelayMs": 0,
+            "launchAtLogin": false
+        }"#;
+        let config: Config = serde_json::from_str(raw).expect("legacy config");
+        assert!(!config.deafen_while_active);
     }
 }
