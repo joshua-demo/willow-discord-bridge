@@ -16,7 +16,8 @@ A tiny Tauri notification-area app that self-mutes—and optionally self-deafens
 - **Hold Ctrl + Windows:** mute Discord until the shortcut is released.
 - **Double-tap Ctrl + Windows:** keep Discord muted during Willow's locked mode.
 - **Tap once while locked:** stop locked mode and restore Discord's prior voice state.
-- Optionally self-deafen Discord too, blocking incoming audio while dictating.
+- Optionally play a Discord Soundboard announcement when dictation starts; self-mute happens first. Paste the sound ID in settings (for example, `1328911757753712702`).
+- Optionally self-deafen Discord too, blocking incoming audio while dictating. When announcing, deafening waits up to five seconds for the sound to finish.
 - Preserve a pre-existing Discord mute/deafen state instead of blindly unmuting.
 - Configurable shortcut, gesture mode, deafen behavior, unmute delay, and start-with-Windows.
 - Encrypt Discord credentials and OAuth tokens with Windows DPAPI.
@@ -92,7 +93,7 @@ Use `npm version patch`, `npm version minor`, or `npm version major`, then push 
 ## Limits
 
 - Synchronization is based on the shared shortcut because Willow has no public recording-state event.
-- Discord RPC requires Discord desktop and developer-application authorization.
+- Discord RPC requires Discord desktop and developer-application authorization. Soundboard playback uses Discord's undocumented local `GET_SOUNDBOARD_SOUNDS` and `PLAY_SOUNDBOARD_SOUND` RPC commands; the bridge looks up the sound's source server automatically. Playing it in another server may require **Use External Sounds** permission. Errors appear in the settings connection panel without preventing self-mute. A sound will not play if you were already deafened or if another sound was attempted in the last five seconds.
 - If Discord's prior state cannot be read, the bridge fails closed rather than risk unmuting you.
 - A hard process kill cannot perform graceful cleanup, although Discord normally reverts RPC-controlled voice settings when its controller disconnects.
 

@@ -7,6 +7,7 @@ type Config = {
   discordRpc: DiscordConfig;
   mode: Mode;
   deafenWhileActive: boolean;
+  soundboardSoundId: string;
   unmuteDelayMs: number;
   launchAtLogin: boolean;
 };
@@ -49,6 +50,7 @@ const elements = {
   delay: $<HTMLInputElement>('delay'),
   delayValue: $('delay-value'),
   deafenWhileActive: $<HTMLInputElement>('deafen-while-active'),
+  soundboardSoundId: $<HTMLInputElement>('soundboard-sound-id'),
   launchAtLogin: $<HTMLInputElement>('launch-at-login'),
   error: $('error'),
   version: $('version'),
@@ -76,6 +78,7 @@ function syncInputs(): void {
   };
   config.unmuteDelayMs = Number(elements.delay.value);
   config.deafenWhileActive = elements.deafenWhileActive.checked;
+  config.soundboardSoundId = elements.soundboardSoundId.value.trim();
   config.launchAtLogin = elements.launchAtLogin.checked;
 }
 
@@ -86,6 +89,7 @@ function render(): void {
   elements.delay.value = String(config.unmuteDelayMs);
   elements.delayValue.textContent = String(config.unmuteDelayMs);
   elements.deafenWhileActive.checked = config.deafenWhileActive;
+  elements.soundboardSoundId.value = config.soundboardSoundId;
   elements.launchAtLogin.checked = config.launchAtLogin;
   for (const button of elements.modes.querySelectorAll<HTMLButtonElement>('button')) {
     button.classList.toggle('active', button.dataset.mode === config.mode);
@@ -164,6 +168,7 @@ elements.modes.addEventListener('click', (event) => {
 elements.delay.addEventListener('input', () => { elements.delayValue.textContent = elements.delay.value; });
 elements.delay.addEventListener('change', () => { void save(); });
 elements.deafenWhileActive.addEventListener('change', () => { void save(); });
+elements.soundboardSoundId.addEventListener('change', () => { void save(); });
 elements.launchAtLogin.addEventListener('change', () => { void save(); });
 elements.connect.addEventListener('click', async () => {
   if (!await save()) return;

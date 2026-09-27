@@ -56,6 +56,8 @@ pub struct Config {
     pub mode: Mode,
     #[serde(default)]
     pub deafen_while_active: bool,
+    #[serde(default)]
+    pub soundboard_sound_id: String,
     pub unmute_delay_ms: u64,
     pub launch_at_login: bool,
 }
@@ -70,6 +72,7 @@ impl Default for Config {
             discord_rpc: DiscordRpc::default(),
             mode: Mode::Auto,
             deafen_while_active: false,
+            soundboard_sound_id: String::new(),
             unmute_delay_ms: 0,
             launch_at_login: true,
         }
@@ -83,6 +86,15 @@ impl Config {
         }
         if self.unmute_delay_ms > 5_000 {
             return Err("Unmute delay must be between 0 and 5000 milliseconds".into());
+        }
+        if !self.soundboard_sound_id.is_empty()
+            && (self.soundboard_sound_id.len() > 20
+                || !self
+                    .soundboard_sound_id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit()))
+        {
+            return Err("Soundboard sound ID must contain only digits (up to 20)".into());
         }
         Ok(())
     }
@@ -283,5 +295,15 @@ mod tests {
         }"#;
         let config: Config = serde_json::from_str(raw).expect("legacy config");
         assert!(!config.deafen_while_active);
+        assert!(config.soundboard_sound_id.is_empty());
+    }
+
+    #[test]
+    fn validates_soundboard_id() {
+        let mut config = Config::default();
+        config.soundboard_sound_id = "1328911757753712702".into();
+        assert!(config.validate().is_ok());
+        config.soundboard_sound_id = "not-a-snowflake".into();
+        assert!(config.validate().is_err());
     }
 }

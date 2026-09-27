@@ -6,7 +6,7 @@ use std::{
     io::{Read, Write},
     sync::{Arc, Mutex, mpsc},
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 #[derive(Clone, Debug, Serialize)]
@@ -55,7 +55,33 @@ pub fn start_worker(
             let mut client: Option<RpcClient> = None;
             let mut prior: Option<VoiceState> = None;
             let mut owns_mute = false;
-            while let Ok(command) = rx.recv() {
+            let mut pending_deafen: Option<Instant> = None;
+            let mut last_sound_attempt: Option<Instant> = None;
+            loop {
+                let command = match pending_deafen {
+                    Some(deadline) => {
+                        rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                    }
+                    None => rx.recv().map_err(|_| mpsc::RecvTimeoutError::Disconnected),
+                };
+                let command = match command {
+                    Ok(command) => command,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        pending_deafen = None;
+                        if owns_mute && store.get().deafen_while_active {
+                            if let Some(rpc) = client.as_mut() {
+                                if let Err(error) = set_active_voice(rpc, prior, true) {
+                                    client = None;
+                                    prior = None;
+                                    owns_mute = false;
+                                    set_rpc_status(&status, RpcState::Disconnected, Some(error));
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                };
                 match command {
                     DiscordCommand::Connect => {
                         set_rpc_status(&status, RpcState::Connecting, None);
@@ -64,10 +90,12 @@ pub fn start_worker(
                                 client = Some(next);
                                 prior = None;
                                 owns_mute = false;
+                                pending_deafen = None;
                                 set_rpc_status(&status, RpcState::Connected, None);
                             }
                             Err(error) => {
                                 client = None;
+                                pending_deafen = None;
                                 set_rpc_status(&status, RpcState::Disconnected, Some(error));
                             }
                         }
@@ -75,16 +103,60 @@ pub fn start_worker(
                     DiscordCommand::SetMute(on) => {
                         let Some(rpc) = client.as_mut() else { continue };
                         let result = if on {
-                            if !owns_mute {
+                            let first_activation = !owns_mute;
+                            if first_activation {
                                 prior = rpc.get_voice_settings().ok();
                                 owns_mute = true;
                             }
-                            set_active_voice(rpc, prior, store.get().deafen_while_active)
+                            let config = store.get();
+                            let can_play = first_activation
+                                && prior.is_some_and(|state| !state.deaf)
+                                && !config.soundboard_sound_id.is_empty()
+                                && last_sound_attempt
+                                    .is_none_or(|last| last.elapsed() >= Duration::from_secs(5));
+                            if can_play {
+                                // Never leave the real microphone open while announcing.
+                                let muted =
+                                    rpc.set_voice_settings(true, prior.map(|state| state.deaf));
+                                muted.and_then(|_| {
+                                    last_sound_attempt = Some(Instant::now());
+                                    match rpc.play_soundboard_sound(&config.soundboard_sound_id) {
+                                        Ok(()) => {
+                                            set_rpc_status(&status, RpcState::Connected, None);
+                                            if config.deafen_while_active {
+                                                // Discord clips last at most five seconds. Don't deafen
+                                                // until the clip finishes; release cancels this timer.
+                                                pending_deafen =
+                                                    Some(Instant::now() + Duration::from_secs(5));
+                                                Ok(())
+                                            } else {
+                                                Ok(())
+                                            }
+                                        }
+                                        Err(error) => {
+                                            // An unsupported soundboard command must not prevent muting.
+                                            set_rpc_status(
+                                                &status,
+                                                RpcState::Connected,
+                                                Some(format!("Soundboard: {error}")),
+                                            );
+                                            set_active_voice(rpc, prior, config.deafen_while_active)
+                                        }
+                                    }
+                                })
+                            } else {
+                                set_active_voice(
+                                    rpc,
+                                    prior,
+                                    config.deafen_while_active && pending_deafen.is_none(),
+                                )
+                            }
                         } else {
                             if !owns_mute {
                                 continue;
                             }
                             owns_mute = false;
+                            pending_deafen = None;
                             match prior.take() {
                                 Some(state) => rpc.set_voice_settings(state.mute, Some(state.deaf)),
                                 None => Ok(()), // fail closed rather than accidentally unmuting
@@ -94,6 +166,7 @@ pub fn start_worker(
                             client = None;
                             prior = None;
                             owns_mute = false;
+                            pending_deafen = None;
                             set_rpc_status(&status, RpcState::Disconnected, Some(error));
                         }
                     }
@@ -102,12 +175,16 @@ pub fn start_worker(
                             continue;
                         }
                         let Some(rpc) = client.as_mut() else { continue };
-                        if let Err(error) =
-                            set_active_voice(rpc, prior, store.get().deafen_while_active)
-                        {
+                        let config = store.get();
+                        if !config.deafen_while_active || config.soundboard_sound_id.is_empty() {
+                            pending_deafen = None;
+                        }
+                        let deafen = config.deafen_while_active && pending_deafen.is_none();
+                        if let Err(error) = set_active_voice(rpc, prior, deafen) {
                             client = None;
                             prior = None;
                             owns_mute = false;
+                            pending_deafen = None;
                             set_rpc_status(&status, RpcState::Disconnected, Some(error));
                         }
                     }
@@ -218,6 +295,12 @@ impl RpcClient {
             mute: data.get("mute").and_then(Value::as_bool).unwrap_or(false),
             deaf: data.get("deaf").and_then(Value::as_bool).unwrap_or(false),
         })
+    }
+
+    fn play_soundboard_sound(&mut self, sound_id: &str) -> Result<(), String> {
+        let sounds = self.request("GET_SOUNDBOARD_SOUNDS", json!({}))?;
+        let args = soundboard_args(&sounds, sound_id)?;
+        self.request("PLAY_SOUNDBOARD_SOUND", args).map(|_| ())
     }
 
     fn set_voice_settings(&mut self, mute: bool, deaf: Option<bool>) -> Result<(), String> {
@@ -351,6 +434,23 @@ fn exchange_token(
         .map_err(|error| error.to_string())
 }
 
+fn soundboard_args(sounds: &Value, sound_id: &str) -> Result<Value, String> {
+    let sound = sounds
+        .as_array()
+        .or_else(|| sounds.get("sounds").and_then(Value::as_array))
+        .and_then(|sounds| {
+            sounds
+                .iter()
+                .find(|sound| sound.get("sound_id").and_then(Value::as_str) == Some(sound_id))
+        })
+        .ok_or_else(|| format!("Sound {sound_id} is not in your available Discord sounds"))?;
+    let mut args = json!({ "sound_id": sound_id });
+    if let Some(guild_id) = sound.get("guild_id").and_then(Value::as_str) {
+        args["guild_id"] = Value::String(guild_id.into());
+    }
+    Ok(args)
+}
+
 fn rpc_error_message(payload: &Value) -> String {
     let message = payload
         .pointer("/data/message")
@@ -387,6 +487,24 @@ mod tests {
         let message = rpc_error_message(&payload);
         assert!(message.contains("App Testers"));
         assert!(message.contains("invalid_scope"));
+    }
+
+    #[test]
+    fn soundboard_command_includes_the_source_guild() {
+        let sounds = json!([{
+            "sound_id": "1328911757753712702",
+            "guild_id": "1322604750080053409",
+            "available": true
+        }]);
+        assert_eq!(
+            soundboard_args(&sounds, "1328911757753712702").unwrap(),
+            json!({ "sound_id": "1328911757753712702", "guild_id": "1322604750080053409" })
+        );
+        assert!(soundboard_args(&sounds, "invalid").is_err());
+        assert_eq!(
+            soundboard_args(&json!([{ "sound_id": "123", "guild_id": null }]), "123").unwrap(),
+            json!({ "sound_id": "123" })
+        );
     }
 
     #[test]

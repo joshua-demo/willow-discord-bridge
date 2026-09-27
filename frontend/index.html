@@ -83,6 +83,11 @@
         </div>
         <input id="delay" type="range" min="0" max="500" step="50" value="0" />
       </div>
+      <div class="field">
+        <label for="soundboard-sound-id">Soundboard announcement (optional)</label>
+        <input id="soundboard-sound-id" type="text" inputmode="numeric" spellcheck="false" autocomplete="off" placeholder="1328911757753712702" />
+        <p class="muted">Paste a sound ID to play it once when dictation starts. Your mic mutes first. If deafening is on, it waits up to five seconds for the clip before deafening. Requires access to the sound in your current voice channel.</p>
+      </div>
       <div class="perm-row">
         <span><strong>Deafen while dictating</strong><span class="muted"> — also block incoming Discord audio</span></span>
         <input class="toggle-switch" id="deafen-while-active" type="checkbox" role="switch" aria-label="Deafen while dictating" />
