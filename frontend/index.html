@@ -12,7 +12,7 @@
     <img class="logo" src="assets/icon.svg" alt="" />
     <div class="hero-text">
       <h1>Willow Discord Bridge</h1>
-      <p>Mute Discord while you dictate with Willow Voice.</p>
+      <p>Mute Discord while you dictate with Willow Voice or Wispr Flow.</p>
     </div>
     <div class="status" id="status">
       <span class="dot" id="status-dot"></span>
@@ -52,14 +52,31 @@
     </section>
 
     <section class="card">
-      <h2>Willow shortcut</h2>
-      <p class="muted">Set this to the exact same shortcut used by Willow Voice. The default is <strong>Ctrl + Windows</strong>.</p>
+      <h2>Dictation shortcuts</h2>
+      <div class="binding">
+        <div class="binding-label"><strong>Dictation app</strong></div>
+        <div class="segment" id="app-segment">
+          <button type="button" data-app="willow">Willow Voice</button>
+          <button type="button" data-app="wispr">Wispr Flow</button>
+        </div>
+      </div>
+      <p class="muted" id="shortcut-help">Use the same shortcut configured in your dictation app. The default is Ctrl + Windows.</p>
       <div class="binding">
         <div class="binding-label">
           <strong>Dictation shortcut</strong>
           <span class="muted">Click the button, then press and release the shortcut</span>
         </div>
         <button class="capture" id="capture-shortcut" type="button">Ctrl + Win</button>
+      </div>
+      <div id="wispr-shortcuts" hidden>
+        <div class="binding">
+          <div class="binding-label">
+            <strong>Hands-free shortcut</strong>
+            <span class="muted">Match Wispr Flow's hands-free shortcut. Default: Ctrl + Win + Space.</span>
+          </div>
+          <button class="capture" id="capture-hands-free" type="button">Ctrl + Win + Space</button>
+        </div>
+        <p class="muted">Escape cancels dictation and restores Discord. Use shortcuts to start and stop; clicking Flow's controls is not detected.</p>
       </div>
     </section>
 
@@ -68,7 +85,7 @@
       <div class="binding">
         <div class="binding-label">
           <strong>Shortcut mode</strong>
-          <span class="muted">Auto mirrors Willow: hold to dictate, double-tap to lock, tap again to stop.</span>
+          <span class="muted" id="mode-help">Auto: hold to dictate, double-tap to lock, tap again to stop.</span>
         </div>
         <div class="segment" id="mode-segment">
           <button type="button" data-mode="auto">Auto</button>
@@ -99,7 +116,7 @@
     </section>
 
     <div class="callout">
-      <strong>How locked mode works:</strong> the bridge observes the same physical shortcut as Willow. It does not read your speech, audio, or typed text. Because Willow has no public recording-state API, both apps must use the same shortcut and gesture.
+      <strong>How it works:</strong> the bridge observes your dictation shortcuts, not your speech, audio, or typed text. Match the shortcuts in Willow Voice or Wispr Flow. Clicking dictation controls, automatic stops, and custom cancellation shortcuts are not detected; stop with the matching shortcut to keep Discord in sync.
     </div>
 
     <p class="err" id="error"></p>

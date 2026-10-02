@@ -2,6 +2,7 @@ mod config;
 mod discord;
 mod gesture;
 mod input;
+mod midi;
 
 use config::{Config, ConfigStore};
 use discord::{BridgeStatus, DiscordCommand};
@@ -60,8 +61,16 @@ fn get_version(app: AppHandle) -> String {
 
 #[tauri::command]
 fn save_config(app: AppHandle, state: State<'_, AppState>, config: Config) -> SaveResult {
+    let previous = state.store.get();
     match state.store.replace_public(config) {
         Ok(saved) => {
+            if previous.dictation_app != saved.dictation_app
+                || previous.shortcut != saved.shortcut
+                || previous.hands_free_shortcut != saved.hands_free_shortcut
+                || previous.mode != saved.mode
+            {
+                state.input.reset_gesture();
+            }
             set_autostart(&app, saved.launch_at_login);
             let _ = state.discord_tx.send(DiscordCommand::RefreshActive);
             SaveResult {
@@ -167,6 +176,10 @@ pub fn run() {
             let store = Arc::new(ConfigStore::load(config_path(&handle)));
             let status = Arc::new(Mutex::new(BridgeStatus::default()));
             let discord_tx = discord::start_worker(store.clone(), status.clone());
+            midi::start(
+                config_path(&handle).with_file_name("midi-pads.json"),
+                discord_tx.clone(),
+            );
             let (input_tx, input_rx) = mpsc::channel();
             let input = Arc::new(InputMonitor::start(store.clone(), input_tx)?);
             if let Ok(mut current) = status.lock() {

@@ -7,3 +7,4 @@ release/
 .env
 .DS_Store
 .claude/
+.local-backup-rodecaster/

@@ -1,6 +1,6 @@
 # Willow Discord Bridge for Windows
 
-A tiny Tauri notification-area app that self-mutes—and optionally self-deafens—Discord while Willow Voice is listening.
+A tiny Tauri notification-area app that self-mutes—and optionally self-deafens—Discord while Willow Voice or Wispr Flow is listening.
 
 > **Attribution:** This project adapts the Discord RPC and shortcut-gesture work
 > pioneered in [Hush](https://github.com/MatthysDev/hush) by
@@ -8,13 +8,14 @@ A tiny Tauri notification-area app that self-mutes—and optionally self-deafens
 > and copyright notice are retained in `LICENSE`; see `NOTICE` for details.
 >
 > This is an unofficial community project and is not affiliated with or endorsed
-> by Willow Voice or Discord.
+> by Willow Voice, Wispr Flow, or Discord.
 
 ## Features
 
 - Close settings without stopping the bridge; it keeps running in the notification area until **Quit** is selected from the tray menu.
 - **Hold Ctrl + Windows:** mute Discord until the shortcut is released.
-- **Double-tap Ctrl + Windows:** keep Discord muted during Willow's locked mode.
+- **Double-tap Ctrl + Windows:** keep Discord muted during Willow's locked mode or Wispr Flow's hands-free mode.
+- **Wispr Flow profile:** also supports the hands-free shortcut (default **Ctrl + Windows + Space**) and **Escape** cancellation.
 - **Tap once while locked:** stop locked mode and restore Discord's prior voice state.
 - Optionally play a Discord Soundboard announcement when dictation starts; self-mute happens first. Paste the sound ID in settings (for example, `1328911757753712702`).
 - Optionally self-deafen Discord too, blocking incoming audio while dictating. When announcing, deafening waits up to five seconds for the sound to finish.
@@ -39,16 +40,53 @@ The settings window uses the WebView2 runtime already supplied by modern Windows
 
 ## How it works
 
-Willow does not expose a Windows recording-state API. The Rust backend therefore observes the same physical shortcut as Willow using `WH_KEYBOARD_LL`, mirrors Willow's hold/double-tap state machine, and writes Discord voice settings through Discord desktop's local named pipe.
+The Rust backend observes the same physical keyboard shortcuts as your selected dictation app using `WH_KEYBOARD_LL`, mirrors its hold/double-tap/hands-free gestures, and writes Discord voice settings through Discord desktop's local named pipe. It does not read speech or typed text.
 
 The tray process starts without a webview. Tauri creates the settings webview only when requested and destroys it when closed, keeping normal background usage small.
 
 ## Requirements
 
 - Windows 10/11 x64
-- Willow Voice for Windows
+- Willow Voice or Wispr Flow for Windows
 - Discord desktop—not Discord in a browser
 - Microsoft Edge WebView2 Runtime for the settings window (normally included with Windows)
+
+## Wispr Flow setup
+
+1. In bridge settings, choose **Wispr Flow** under **Dictation app**. Existing installations stay on Willow until you switch.
+2. Match **Dictation shortcut** to Flow's push-to-talk shortcut (default **Ctrl + Windows**) and **Hands-free shortcut** to Flow's hands-free shortcut (default **Ctrl + Windows + Space**). Capture them separately if customized.
+3. Leave **Shortcut mode** on **Auto**: hold to dictate, double-tap within half a second to lock, or use the hands-free shortcut. Press the shortcut again to stop; **Escape** cancels and restores Discord.
+4. Soundboard announcements, optional deafening, and prior-state restoration work with either app. Only the selected profile is monitored; do not run both apps on the same shortcut at the same time.
+
+The bridge mirrors keyboard gestures, not Flow's actual recording state. Clicking the Flow Bar to start/stop, automatic stops, mouse shortcuts, or a customized cancel shortcut are not detected. Use the matching keyboard shortcuts to keep Discord synchronized. Flow may also reject a shortcut when setup is incomplete or dictation is unavailable.
+
+## RØDECaster MIDI pads
+
+The bridge can also trigger Discord's built-in Soundboard from MIDI pads. Create
+`%APPDATA%\com.willowdiscordbridge.desktop\midi-pads.json` and restart the bridge:
+
+```json
+{
+  "device": "MIDI function",
+  "channel": 1,
+  "pads": [
+    { "control": 18, "name": "My sound", "sound_id": "YOUR_SOUND_ID" }
+  ]
+}
+```
+
+Use a numeric Discord sound ID. Configure each RØDECaster pad as **MIDI →
+Momentary** and match its displayed CC control number and channel. Positive CC
+values trigger playback; release values of zero are ignored. On the Duo, default
+Bank 4 controls run down the left column (18–20), then down the right (21–23).
+Leave pad-editing/Transfer Mode before testing the physical buttons.
+
+The listener uses the existing Discord authorization and does not change voice
+mute/deafen state. Discord must be running and you must be in an eligible voice
+channel. Playback failures and MIDI connection status appear in `midi-pads.log`
+beside the mapping file. The bridge waits for a disconnected MIDI device to return;
+restart it if a rapid reconnect is not detected. Remove the mapping file and restart
+to disable MIDI input. Configuration changes take effect after restarting.
 
 ## Discord RPC setup
 
@@ -92,7 +130,7 @@ Use `npm version patch`, `npm version minor`, or `npm version major`, then push 
 
 ## Limits
 
-- Synchronization is based on the shared shortcut because Willow has no public recording-state event.
+- Synchronization is based on shared keyboard shortcuts, not actual recording-state events. Stops initiated through app UI or automatic cancellation can leave the bridge active; use the stop shortcut (or Escape with the Wispr profile) to restore Discord.
 - Discord RPC requires Discord desktop and developer-application authorization. Soundboard playback uses Discord's undocumented local `GET_SOUNDBOARD_SOUNDS` and `PLAY_SOUNDBOARD_SOUND` RPC commands; the bridge looks up the sound's source server automatically. Playing it in another server may require **Use External Sounds** permission. Errors appear in the settings connection panel without preventing self-mute. A sound will not play if you were already deafened or if another sound was attempted in the last five seconds.
 - If Discord's prior state cannot be read, the bridge fails closed rather than risk unmuting you.
 - A hard process kill cannot perform graceful cleanup, although Discord normally reverts RPC-controlled voice settings when its controller disconnects.

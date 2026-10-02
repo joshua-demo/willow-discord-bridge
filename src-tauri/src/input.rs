@@ -1,4 +1,4 @@
-use crate::config::{ConfigStore, Mod, Shortcut};
+use crate::config::{Config, ConfigStore, DictationApp, Mod, Shortcut};
 use serde::Serialize;
 use std::{
     collections::HashSet,
@@ -22,10 +22,12 @@ use windows::Win32::{
     },
 };
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InputEvent {
     Press,
     Release,
+    HandsFreePress,
+    Dismiss,
 }
 
 #[derive(Debug, Serialize)]
@@ -40,7 +42,8 @@ pub struct CaptureResult {
 struct Keys {
     mods: HashSet<ModKey>,
     active: bool,
-    key_latched: bool,
+    hands_free_active: bool,
+    pressed_keys: HashSet<String>,
     capture_peak: HashSet<ModKey>,
 }
 
@@ -80,7 +83,7 @@ impl InputMonitor {
             .set(shared.clone())
             .map_err(|_| "Keyboard monitor already started")?;
         thread::Builder::new()
-            .name("willow-keyboard-hook".into())
+            .name("dictation-keyboard-hook".into())
             .spawn(|| unsafe {
                 let module = GetModuleHandleW(None).unwrap_or_default();
                 let hook = SetWindowsHookExW(
@@ -99,6 +102,16 @@ impl InputMonitor {
             })
             .map_err(|error| error.to_string())?;
         Ok(Self { shared })
+    }
+
+    pub fn reset_gesture(&self) {
+        if let Ok(mut keys) = self.shared.keys.lock() {
+            keys.active = false;
+            keys.hands_free_active = false;
+            keys.mods.clear();
+            keys.pressed_keys.clear();
+            let _ = self.shared.event_tx.send(InputEvent::Dismiss);
+        }
     }
 
     pub fn capture(&self) -> CaptureResult {
@@ -191,43 +204,49 @@ fn handle_key(shared: &Shared, vk: u32, down: bool) {
         } else {
             keys.mods.remove(&modifier);
         }
-        evaluate_modifier_shortcut(shared, &mut keys);
-        return;
+    } else if down {
+        keys.pressed_keys.insert(key_name(vk));
+    } else {
+        keys.pressed_keys.remove(&key_name(vk));
     }
 
-    let shortcut = shared.config.get().shortcut;
-    if shortcut.key.is_empty() {
+    let config = shared.config.get();
+    if config.dictation_app == DictationApp::Wispr && down && vk == VK_ESCAPE.0 as u32 {
+        let _ = shared.event_tx.send(InputEvent::Dismiss);
         return;
     }
-    if key_name(vk) != shortcut.key {
-        return;
+    evaluate_shortcuts(&mut keys, &config, &shared.event_tx);
+}
+
+fn evaluate_shortcuts(keys: &mut Keys, config: &Config, event_tx: &mpsc::Sender<InputEvent>) {
+    let required_down = shortcut_down(&config.shortcut, keys);
+    if required_down && exact_mods(&keys.mods, &config.shortcut.mods) && !keys.active {
+        keys.active = true;
+        let _ = event_tx.send(InputEvent::Press);
+    } else if keys.active && !required_down {
+        keys.active = false;
+        let _ = event_tx.send(InputEvent::Release);
     }
-    if down && !keys.key_latched && exact_mods(&keys.mods, &shortcut.mods) {
-        keys.key_latched = true;
-        let _ = shared.event_tx.send(InputEvent::Press);
-    } else if !down && keys.key_latched {
-        keys.key_latched = false;
-        let _ = shared.event_tx.send(InputEvent::Release);
+    if config.dictation_app == DictationApp::Wispr {
+        let required_down = shortcut_down(&config.hands_free_shortcut, keys);
+        if required_down
+            && exact_mods(&keys.mods, &config.hands_free_shortcut.mods)
+            && !keys.hands_free_active
+        {
+            keys.hands_free_active = true;
+            let _ = event_tx.send(InputEvent::HandsFreePress);
+        } else if keys.hands_free_active && !required_down {
+            keys.hands_free_active = false;
+        }
     }
 }
 
-fn evaluate_modifier_shortcut(shared: &Shared, keys: &mut Keys) {
-    let shortcut = shared.config.get().shortcut;
-    if !shortcut.key.is_empty() {
-        return;
-    }
-    let required_down = shortcut
+fn shortcut_down(shortcut: &Shortcut, keys: &Keys) -> bool {
+    shortcut
         .mods
         .iter()
-        .all(|value| keys.mods.contains(&to_mod_key(value)));
-    let exact = required_down && keys.mods.len() == shortcut.mods.len();
-    if exact && !keys.active {
-        keys.active = true;
-        let _ = shared.event_tx.send(InputEvent::Press);
-    } else if keys.active && !required_down {
-        keys.active = false;
-        let _ = shared.event_tx.send(InputEvent::Release);
-    }
+        .all(|value| keys.mods.contains(&to_mod_key(value)))
+        && (shortcut.key.is_empty() || keys.pressed_keys.contains(&shortcut.key))
 }
 
 fn finish_capture(shared: &Shared, combo: Shortcut) {
@@ -290,5 +309,69 @@ fn from_mod_key(value: ModKey) -> Mod {
         ModKey::Alt => Mod::Alt,
         ModKey::Cmd => Mod::Cmd,
         ModKey::Shift => Mod::Shift,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wispr_hands_free_emits_once_per_press_and_primary_releases() {
+        let config = Config {
+            dictation_app: DictationApp::Wispr,
+            ..Config::default()
+        };
+        let (tx, rx) = mpsc::channel();
+        let mut keys = Keys::default();
+        keys.mods.extend([ModKey::Ctrl, ModKey::Cmd]);
+        evaluate_shortcuts(&mut keys, &config, &tx);
+        assert_eq!(rx.try_recv().unwrap(), InputEvent::Press);
+        keys.pressed_keys.insert("VK_20".into());
+        evaluate_shortcuts(&mut keys, &config, &tx);
+        evaluate_shortcuts(&mut keys, &config, &tx);
+        assert_eq!(rx.try_recv().unwrap(), InputEvent::HandsFreePress);
+        assert!(rx.try_recv().is_err());
+        keys.mods.clear();
+        evaluate_shortcuts(&mut keys, &config, &tx);
+        assert_eq!(rx.try_recv().unwrap(), InputEvent::Release);
+        keys.mods.extend([ModKey::Ctrl, ModKey::Cmd]);
+        evaluate_shortcuts(&mut keys, &config, &tx);
+        assert_eq!(rx.try_recv().unwrap(), InputEvent::Press);
+        assert_eq!(rx.try_recv().unwrap(), InputEvent::HandsFreePress);
+    }
+
+    #[test]
+    fn willow_ignores_the_hands_free_shortcut() {
+        let config = Config::default();
+        let (tx, rx) = mpsc::channel();
+        let mut keys = Keys::default();
+        keys.mods.extend([ModKey::Ctrl, ModKey::Cmd]);
+        keys.pressed_keys.insert("VK_20".into());
+        evaluate_shortcuts(&mut keys, &config, &tx);
+        assert_eq!(rx.try_recv().unwrap(), InputEvent::Press);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn custom_hands_free_keys_are_supported() {
+        let mut config = Config {
+            dictation_app: DictationApp::Wispr,
+            ..Config::default()
+        };
+        config.hands_free_shortcut = Shortcut {
+            mods: vec![Mod::Alt],
+            key: "F8".into(),
+        };
+        let (tx, rx) = mpsc::channel();
+        let mut keys = Keys::default();
+        keys.mods.insert(ModKey::Alt);
+        keys.pressed_keys.insert("F8".into());
+        evaluate_shortcuts(&mut keys, &config, &tx);
+        assert_eq!(rx.try_recv().unwrap(), InputEvent::HandsFreePress);
+        keys.pressed_keys.clear();
+        evaluate_shortcuts(&mut keys, &config, &tx);
+        assert!(!keys.hands_free_active);
+        assert!(rx.try_recv().is_err());
     }
 }

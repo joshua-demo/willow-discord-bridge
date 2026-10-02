@@ -39,6 +39,7 @@ impl Default for BridgeStatus {
 
 pub enum DiscordCommand {
     Connect,
+    PlaySound(String, mpsc::SyncSender<Result<(), String>>),
     SetMute(bool),
     RefreshActive,
     Shutdown,
@@ -83,6 +84,34 @@ pub fn start_worker(
                     Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 };
                 match command {
+                    DiscordCommand::PlaySound(sound_id, reply) => {
+                        let result = (|| {
+                            if client.is_none() {
+                                client = Some(connect_authenticated(&store)?);
+                            }
+                            client
+                                .as_mut()
+                                .expect("connected")
+                                .play_soundboard_sound(&sound_id)
+                        })();
+                        // Playback never changes mute/deafen state or retries a sound: a
+                        // lost reply could otherwise cause duplicate playback.
+                        // Reconnect on the next press after an error, unless this
+                        // connection still owns a dictation mute that must be restored.
+                        if result.is_err() && !owns_mute {
+                            client = None;
+                        }
+                        set_rpc_status(
+                            &status,
+                            if client.is_some() {
+                                RpcState::Connected
+                            } else {
+                                RpcState::Disconnected
+                            },
+                            result.as_ref().err().cloned(),
+                        );
+                        let _ = reply.try_send(result);
+                    }
                     DiscordCommand::Connect => {
                         set_rpc_status(&status, RpcState::Connecting, None);
                         match connect_authenticated(&store) {

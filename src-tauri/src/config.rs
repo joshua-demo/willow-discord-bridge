@@ -19,7 +19,7 @@ pub enum Mod {
     Shift,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct Shortcut {
     pub mods: Vec<Mod>,
@@ -27,7 +27,22 @@ pub struct Shortcut {
     pub key: String,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum DictationApp {
+    #[default]
+    Willow,
+    Wispr,
+}
+
+fn default_hands_free_shortcut() -> Shortcut {
+    Shortcut {
+        mods: vec![Mod::Ctrl, Mod::Cmd],
+        key: "VK_20".into(), // Space
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum Mode {
     Auto,
@@ -51,6 +66,10 @@ pub struct DiscordRpc {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Config {
+    #[serde(default)]
+    pub dictation_app: DictationApp,
+    #[serde(default = "default_hands_free_shortcut")]
+    pub hands_free_shortcut: Shortcut,
     pub shortcut: Shortcut,
     pub discord_rpc: DiscordRpc,
     pub mode: Mode,
@@ -65,6 +84,8 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            dictation_app: DictationApp::Willow,
+            hands_free_shortcut: default_hands_free_shortcut(),
             shortcut: Shortcut {
                 mods: vec![Mod::Ctrl, Mod::Cmd],
                 key: String::new(),
@@ -83,6 +104,21 @@ impl Config {
     pub fn validate(&self) -> Result<(), String> {
         if self.shortcut.mods.is_empty() && self.shortcut.key.is_empty() {
             return Err("Shortcut must contain a key or modifier".into());
+        }
+        if self.dictation_app == DictationApp::Wispr {
+            if self.hands_free_shortcut.mods.is_empty() && self.hands_free_shortcut.key.is_empty() {
+                return Err("Hands-free shortcut must contain a key or modifier".into());
+            }
+            if self.shortcut.key == self.hands_free_shortcut.key
+                && self.shortcut.mods.len() == self.hands_free_shortcut.mods.len()
+                && self
+                    .shortcut
+                    .mods
+                    .iter()
+                    .all(|value| self.hands_free_shortcut.mods.contains(value))
+            {
+                return Err("Dictation and hands-free shortcuts must be different".into());
+            }
         }
         if self.unmute_delay_ms > 5_000 {
             return Err("Unmute delay must be between 0 and 5000 milliseconds".into());
@@ -296,6 +332,17 @@ mod tests {
         let config: Config = serde_json::from_str(raw).expect("legacy config");
         assert!(!config.deafen_while_active);
         assert!(config.soundboard_sound_id.is_empty());
+        assert_eq!(config.dictation_app, DictationApp::Willow);
+        assert_eq!(config.hands_free_shortcut.key, "VK_20");
+    }
+
+    #[test]
+    fn wispr_shortcuts_must_be_distinct() {
+        let mut config = Config::default();
+        config.dictation_app = DictationApp::Wispr;
+        assert!(config.validate().is_ok());
+        config.hands_free_shortcut = config.shortcut.clone();
+        assert!(config.validate().is_err());
     }
 
     #[test]

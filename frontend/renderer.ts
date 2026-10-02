@@ -1,8 +1,11 @@
 type Mode = 'auto' | 'hold' | 'toggle';
+type DictationApp = 'willow' | 'wispr';
 type Mod = 'ctrl' | 'alt' | 'cmd' | 'shift';
 type Shortcut = { mods: Mod[]; key: string };
 type DiscordConfig = { clientId: string; clientSecret: string };
 type Config = {
+  dictationApp: DictationApp;
+  handsFreeShortcut: Shortcut;
   shortcut: Shortcut;
   discordRpc: DiscordConfig;
   mode: Mode;
@@ -46,6 +49,11 @@ const elements = {
   setupSteps: $('setup-steps'),
   openPortal: $<HTMLButtonElement>('open-portal'),
   capture: $<HTMLButtonElement>('capture-shortcut'),
+  captureHandsFree: $<HTMLButtonElement>('capture-hands-free'),
+  apps: $('app-segment'),
+  wisprShortcuts: $('wispr-shortcuts'),
+  shortcutHelp: $('shortcut-help'),
+  modeHelp: $('mode-help'),
   modes: $('mode-segment'),
   delay: $<HTMLInputElement>('delay'),
   delayValue: $('delay-value'),
@@ -63,7 +71,7 @@ let saveQueue = Promise.resolve();
 
 function comboLabel(combo: Shortcut): string {
   const parts = MOD_ORDER.filter((mod) => combo.mods.includes(mod)).map((mod) => MOD_LABEL[mod]);
-  if (combo.key) parts.push(combo.key.toUpperCase());
+  if (combo.key) parts.push(combo.key === 'VK_20' ? 'Space' : combo.key.toUpperCase());
   return parts.join(' + ') || 'Not set';
 }
 
@@ -86,6 +94,16 @@ function render(): void {
   elements.rpcId.value = config.discordRpc.clientId || '';
   elements.rpcSecret.value = config.discordRpc.clientSecret || '';
   elements.capture.textContent = comboLabel(config.shortcut);
+  elements.captureHandsFree.textContent = comboLabel(config.handsFreeShortcut);
+  elements.wisprShortcuts.hidden = config.dictationApp !== 'wispr';
+  const appName = config.dictationApp === 'wispr' ? 'Wispr Flow' : 'Willow Voice';
+  elements.shortcutHelp.textContent = `Match the push-to-talk shortcut in ${appName}. The default is Ctrl + Windows.`;
+  elements.modeHelp.textContent = config.dictationApp === 'wispr'
+    ? 'Auto: hold to dictate or double-tap for hands-free. The hands-free shortcut also starts/stops dictation.'
+    : 'Auto mirrors Willow: hold to dictate, double-tap to lock, tap again to stop.';
+  for (const button of elements.apps.querySelectorAll<HTMLButtonElement>('button')) {
+    button.classList.toggle('active', button.dataset.app === config.dictationApp);
+  }
   elements.delay.value = String(config.unmuteDelayMs);
   elements.delayValue.textContent = String(config.unmuteDelayMs);
   elements.deafenWhileActive.checked = config.deafenWhileActive;
@@ -122,9 +140,10 @@ function renderStatus(status: Status): void {
     elements.statusLabel.textContent = 'Shortcut listener unavailable';
     elements.statusDot.className = 'dot warn';
   } else if (status.active) {
+    const appName = config.dictationApp === 'wispr' ? 'Wispr Flow' : 'Willow';
     elements.statusLabel.textContent = config.deafenWhileActive
-      ? 'Discord muted and deafened — Willow is listening'
-      : 'Discord muted — Willow is listening';
+      ? `Discord muted/deafening — ${appName} is listening`
+      : `Discord muted — ${appName} is listening`;
     elements.statusDot.className = 'dot active';
   } else {
     elements.statusLabel.textContent = 'Ready';
@@ -137,24 +156,40 @@ function renderStatus(status: Status): void {
   elements.rpcError.hidden = !status.rpcError;
 }
 
-elements.capture.addEventListener('click', async () => {
+async function captureShortcut(field: 'shortcut' | 'handsFreeShortcut', button: HTMLButtonElement): Promise<void> {
   if (capturing) return;
   capturing = true;
   showError();
-  elements.capture.classList.add('armed');
-  elements.capture.textContent = 'Press shortcut…';
-  const result = await invoke<CaptureResult>('capture_shortcut');
-  elements.capture.classList.remove('armed');
-  capturing = false;
-  if (result.combo) {
-    config.shortcut = result.combo;
-    await save();
-  } else if (result.reason === 'timeout') {
-    showError('No shortcut was detected within eight seconds.');
-  } else if (result.reason && result.reason !== 'cancelled') {
-    showError(result.reason);
+  button.classList.add('armed');
+  button.textContent = 'Press shortcut…';
+  try {
+    const result = await invoke<CaptureResult>('capture_shortcut');
+    if (result.combo) {
+      config[field] = result.combo;
+      await save();
+    } else if (result.reason === 'timeout') {
+      showError('No shortcut was detected within eight seconds.');
+    } else if (result.reason && result.reason !== 'cancelled') {
+      showError(result.reason);
+    }
+  } catch (error) {
+    showError(String(error));
+  } finally {
+    button.classList.remove('armed');
+    capturing = false;
+    render();
   }
+}
+
+elements.capture.addEventListener('click', () => { void captureShortcut('shortcut', elements.capture); });
+elements.captureHandsFree.addEventListener('click', () => { void captureShortcut('handsFreeShortcut', elements.captureHandsFree); });
+elements.apps.addEventListener('click', (event) => {
+  const target = event.target as HTMLButtonElement;
+  if (!target.dataset.app || capturing) return;
+  config.dictationApp = target.dataset.app as DictationApp;
+  config.mode = 'auto';
   render();
+  void save();
 });
 
 elements.modes.addEventListener('click', (event) => {
