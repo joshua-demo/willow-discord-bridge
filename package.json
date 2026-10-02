@@ -1,6 +1,6 @@
 {
   "name": "willow-discord-bridge",
-  "version": "0.3.4",
+  "version": "0.3.5",
   "description": "Tiny Windows tray app that mutes Discord while Willow Voice is dictating",
   "author": "Willow Discord Bridge contributors",
   "license": "MIT",

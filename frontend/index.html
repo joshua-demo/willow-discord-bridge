@@ -103,7 +103,7 @@
       <div class="field">
         <label for="soundboard-sound-id">Soundboard announcement (optional)</label>
         <input id="soundboard-sound-id" type="text" inputmode="numeric" spellcheck="false" autocomplete="off" placeholder="1328911757753712702" />
-        <p class="muted">Paste a sound ID to play it once when dictation starts. Your mic mutes first. If deafening is on, it waits up to five seconds for the clip before deafening. Requires access to the sound in your current voice channel.</p>
+        <p class="muted">Paste a sound ID to play it once when dictation starts. Mute and sound requests are sent back-to-back. If deafening is on, it follows a short 100 ms pause after the sound request so Discord can start sending the clip. The bridge does not wait for the whole clip. Requires access to the sound in your current voice channel.</p>
       </div>
       <div class="perm-row">
         <span><strong>Deafen while dictating</strong><span class="muted"> — also block incoming Discord audio</span></span>
