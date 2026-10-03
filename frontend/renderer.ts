@@ -11,6 +11,7 @@ type Config = {
   mode: Mode;
   deafenWhileActive: boolean;
   soundboardSoundId: string;
+  soundboardGuildIds: string[];
   unmuteDelayMs: number;
   launchAtLogin: boolean;
 };
@@ -52,13 +53,12 @@ const elements = {
   captureHandsFree: $<HTMLButtonElement>('capture-hands-free'),
   apps: $('app-segment'),
   wisprShortcuts: $('wispr-shortcuts'),
-  shortcutHelp: $('shortcut-help'),
-  modeHelp: $('mode-help'),
   modes: $('mode-segment'),
   delay: $<HTMLInputElement>('delay'),
   delayValue: $('delay-value'),
   deafenWhileActive: $<HTMLInputElement>('deafen-while-active'),
   soundboardSoundId: $<HTMLInputElement>('soundboard-sound-id'),
+  soundboardGuildIds: $<HTMLTextAreaElement>('soundboard-guild-ids'),
   launchAtLogin: $<HTMLInputElement>('launch-at-login'),
   error: $('error'),
   version: $('version'),
@@ -77,6 +77,7 @@ function comboLabel(combo: Shortcut): string {
 
 function showError(message = ''): void {
   elements.error.textContent = message;
+  elements.error.hidden = !message;
 }
 
 function syncInputs(): void {
@@ -87,6 +88,7 @@ function syncInputs(): void {
   config.unmuteDelayMs = Number(elements.delay.value);
   config.deafenWhileActive = elements.deafenWhileActive.checked;
   config.soundboardSoundId = elements.soundboardSoundId.value.trim();
+  config.soundboardGuildIds = [...new Set(elements.soundboardGuildIds.value.split(/[\s,]+/).filter(Boolean))];
   config.launchAtLogin = elements.launchAtLogin.checked;
 }
 
@@ -96,11 +98,6 @@ function render(): void {
   elements.capture.textContent = comboLabel(config.shortcut);
   elements.captureHandsFree.textContent = comboLabel(config.handsFreeShortcut);
   elements.wisprShortcuts.hidden = config.dictationApp !== 'wispr';
-  const appName = config.dictationApp === 'wispr' ? 'Wispr Flow' : 'Willow Voice';
-  elements.shortcutHelp.textContent = `Match the push-to-talk shortcut in ${appName}. The default is Ctrl + Windows.`;
-  elements.modeHelp.textContent = config.dictationApp === 'wispr'
-    ? 'Auto: hold to dictate or double-tap for hands-free. The hands-free shortcut also starts/stops dictation.'
-    : 'Auto mirrors Willow: hold to dictate, double-tap to lock, tap again to stop.';
   for (const button of elements.apps.querySelectorAll<HTMLButtonElement>('button')) {
     button.classList.toggle('active', button.dataset.app === config.dictationApp);
   }
@@ -108,6 +105,7 @@ function render(): void {
   elements.delayValue.textContent = String(config.unmuteDelayMs);
   elements.deafenWhileActive.checked = config.deafenWhileActive;
   elements.soundboardSoundId.value = config.soundboardSoundId;
+  elements.soundboardGuildIds.value = config.soundboardGuildIds.join('\n');
   elements.launchAtLogin.checked = config.launchAtLogin;
   for (const button of elements.modes.querySelectorAll<HTMLButtonElement>('button')) {
     button.classList.toggle('active', button.dataset.mode === config.mode);
@@ -137,13 +135,10 @@ function save(): Promise<boolean> {
 
 function renderStatus(status: Status): void {
   if (!status.engineReady) {
-    elements.statusLabel.textContent = 'Shortcut listener unavailable';
+    elements.statusLabel.textContent = 'Listener unavailable';
     elements.statusDot.className = 'dot warn';
   } else if (status.active) {
-    const appName = config.dictationApp === 'wispr' ? 'Wispr Flow' : 'Willow';
-    elements.statusLabel.textContent = config.deafenWhileActive
-      ? `Discord muted/deafening — ${appName} is listening`
-      : `Discord muted — ${appName} is listening`;
+    elements.statusLabel.textContent = 'Dictating';
     elements.statusDot.className = 'dot active';
   } else {
     elements.statusLabel.textContent = 'Ready';
@@ -168,7 +163,7 @@ async function captureShortcut(field: 'shortcut' | 'handsFreeShortcut', button: 
       config[field] = result.combo;
       await save();
     } else if (result.reason === 'timeout') {
-      showError('No shortcut was detected within eight seconds.');
+      showError('Shortcut capture timed out.');
     } else if (result.reason && result.reason !== 'cancelled') {
       showError(result.reason);
     }
@@ -204,12 +199,13 @@ elements.delay.addEventListener('input', () => { elements.delayValue.textContent
 elements.delay.addEventListener('change', () => { void save(); });
 elements.deafenWhileActive.addEventListener('change', () => { void save(); });
 elements.soundboardSoundId.addEventListener('change', () => { void save(); });
+elements.soundboardGuildIds.addEventListener('change', () => { void save(); });
 elements.launchAtLogin.addEventListener('change', () => { void save(); });
 elements.connect.addEventListener('click', async () => {
   if (!await save()) return;
   elements.connect.textContent = 'Connecting…';
   await invoke('reconnect_discord');
-  elements.connect.textContent = 'Save and connect';
+  elements.connect.textContent = 'Connect';
 });
 elements.setupHelp.addEventListener('click', () => { elements.setupSteps.hidden = !elements.setupSteps.hidden; });
 elements.openPortal.addEventListener('click', () => invoke('open_url', { url: 'https://discord.com/developers/applications' }));
@@ -217,7 +213,7 @@ elements.openPortal.addEventListener('click', () => invoke('open_url', { url: 'h
 (async () => {
   config = await invoke<Config>('get_config');
   render();
-  elements.version.textContent = `Version ${await invoke<string>('get_version')}`;
+  elements.version.textContent = `v${await invoke<string>('get_version')}`;
   renderStatus(await invoke<Status>('get_status'));
   await window.__TAURI__.event.listen<Status>('bridge-status', (event) => renderStatus(event.payload));
   setInterval(async () => renderStatus(await invoke<Status>('get_status')), 2000);

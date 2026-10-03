@@ -17,9 +17,10 @@ A tiny Tauri notification-area app that self-mutes—and optionally self-deafens
 - **Double-tap Ctrl + Windows:** keep Discord muted during Willow's locked mode or Wispr Flow's hands-free mode.
 - **Wispr Flow profile:** also supports the hands-free shortcut (default **Ctrl + Windows + Space**) and **Escape** cancellation.
 - **Tap once while locked:** stop locked mode and restore Discord's prior voice state.
-- Optionally play a Discord Soundboard announcement when dictation starts; mute and playback requests are sent back-to-back. Paste the sound ID in settings (for example, `1328911757753712702`).
+- Optionally play a Discord Soundboard announcement when dictation starts, only in guilds on the editable **Allowed guilds** list (default: `1539407179117760542`); mute and playback requests are sent back-to-back. Paste the sound ID in settings (for example, `1328911757753712702`).
 - Optionally self-deafen Discord too, blocking incoming audio while dictating. When announcing, deafening follows a short 100 ms grace period after Discord accepts the sound request, allowing the clip to start instead of waiting for the whole sound to finish.
-- Preserve a pre-existing Discord mute/deafen state instead of blindly unmuting.
+- Mute/deafen and prior-state restoration work in all servers. Outside the allowlist (or in DMs/no call), playback is skipped and there is no Soundboard deafen delay. If the guild lookup fails, sounds are skipped without blocking mute/deafen.
+- Read your own voice-channel self-mute/deafen flags before dictation. Starting mute/deafen flags are never automatically cleared. A manual deafen during mute-only dictation is kept when dictation stops.
 - Configurable shortcut, gesture mode, deafen behavior, unmute delay, and start-with-Windows.
 - Encrypt Discord credentials and OAuth tokens with Windows DPAPI.
 - Direct Discord local RPC—no simulated Discord keypresses or internet-facing server.
@@ -83,7 +84,8 @@ Leave pad-editing/Transfer Mode before testing the physical buttons.
 
 The listener uses the existing Discord authorization and does not change voice
 mute/deafen state. Discord must be running and you must be in an eligible voice
-channel. Playback failures and MIDI connection status appear in `midi-pads.log`
+channel in an allowed guild. The **Allowed guilds** setting applies to MIDI sounds too; an empty list disables all Soundboard playback.
+Playback failures and MIDI connection status appear in `midi-pads.log`
 beside the mapping file. The bridge waits for a disconnected MIDI device to return;
 restart it if a rapid reconnect is not detected. Remove the mapping file and restart
 to disable MIDI input. Configuration changes take effect after restarting.
@@ -132,7 +134,7 @@ Use `npm version patch`, `npm version minor`, or `npm version major`, then push 
 
 - Synchronization is based on shared keyboard shortcuts, not actual recording-state events. Stops initiated through app UI or automatic cancellation can leave the bridge active; use the stop shortcut (or Escape with the Wispr profile) to restore Discord.
 - Discord RPC requires Discord desktop and developer-application authorization. Soundboard playback uses Discord's undocumented local `GET_SOUNDBOARD_SOUNDS` and `PLAY_SOUNDBOARD_SOUND` RPC commands; the bridge looks up the sound's source server automatically and caches it for the connection to avoid repeating that lookup during dictation. Playing it in another server may require **Use External Sounds** permission. Errors appear in the settings connection panel without preventing self-mute. Mute and playback requests are pipelined, not atomic; there can be a brief open-mic window before Discord applies mute. A sound will not play if you were already deafened or if another sound was attempted in the last five seconds.
-- If Discord's prior state cannot be read, the bridge fails closed rather than risk unmuting you.
+- If Discord's prior or current state cannot be read, the bridge does not guess an unmute. Manual changes are detected by comparing the current state with the last state the bridge applied; a click that leaves the effective state unchanged cannot be distinguished from the bridge's own mute/deafen.
 - A hard process kill cannot perform graceful cleanup, although Discord normally reverts RPC-controlled voice settings when its controller disconnects.
 
 ## Attribution and license

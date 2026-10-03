@@ -10,10 +10,7 @@
 <body>
   <header class="hero">
     <img class="logo" src="assets/icon.svg" alt="" />
-    <div class="hero-text">
-      <h1>Willow Discord Bridge</h1>
-      <p>Mute Discord while you dictate with Willow Voice or Wispr Flow.</p>
-    </div>
+    <div class="hero-text"><h1>Willow Discord Bridge</h1></div>
     <div class="status" id="status">
       <span class="dot" id="status-dot"></span>
       <span id="status-label">Starting…</span>
@@ -23,103 +20,95 @@
   <main>
     <section class="card">
       <div class="card-head">
-        <h2>Discord connection</h2>
+        <h2>Discord</h2>
         <span id="rpc-state" class="pill pill-off">Not connected</span>
       </div>
-      <p class="muted">The bridge controls self-mute through Discord desktop's local RPC connection. It does not simulate a keypress.</p>
       <div class="field">
-        <label for="rpc-id">Discord application Client ID</label>
+        <label for="rpc-id">Client ID</label>
         <input id="rpc-id" type="text" spellcheck="false" autocomplete="off" placeholder="123456789012345678" />
       </div>
       <div class="field">
-        <label for="rpc-secret">Discord application Client Secret</label>
-        <input id="rpc-secret" type="password" spellcheck="false" autocomplete="off" placeholder="Paste your client secret" />
+        <label for="rpc-secret">Client Secret</label>
+        <input id="rpc-secret" type="password" spellcheck="false" autocomplete="off" />
       </div>
       <div class="row-actions">
-        <button class="primary" id="connect" type="button">Save and connect</button>
-        <button class="ghost" id="setup-help" type="button">Discord setup instructions</button>
+        <button class="primary" id="connect" type="button">Connect</button>
+        <button class="ghost" id="setup-help" type="button">Setup</button>
       </div>
       <p class="err" id="rpc-error" hidden></p>
       <div class="callout" id="setup-steps" hidden>
         <ol>
-          <li>Create an application in the Discord Developer Portal.</li>
-          <li>Add the exact Discord account signed in to the desktop app under <strong>App Testers</strong>. Discord rejects the required RPC voice scope for other accounts.</li>
-          <li>Add the OAuth redirect URI <code>http://localhost</code>.</li>
-          <li>Paste the Client ID and Client Secret above, then approve the prompt in Discord desktop.</li>
+          <li>Create a Discord application.</li>
+          <li>Add your Discord account to <strong>App Testers</strong>.</li>
+          <li>Set the OAuth redirect URI to <code>http://localhost</code>.</li>
+          <li>Enter its credentials and approve the Discord prompt.</li>
         </ol>
-        <button class="link-button" id="open-portal" type="button">Open Discord Developer Portal</button>
+        <button class="link-button" id="open-portal" type="button">Developer Portal</button>
       </div>
     </section>
 
     <section class="card">
-      <h2>Dictation shortcuts</h2>
+      <h2>Shortcuts</h2>
       <div class="binding">
-        <div class="binding-label"><strong>Dictation app</strong></div>
+        <div class="binding-label"><strong>App</strong></div>
         <div class="segment" id="app-segment">
           <button type="button" data-app="willow">Willow Voice</button>
           <button type="button" data-app="wispr">Wispr Flow</button>
         </div>
       </div>
-      <p class="muted" id="shortcut-help">Use the same shortcut configured in your dictation app. The default is Ctrl + Windows.</p>
       <div class="binding">
-        <div class="binding-label">
-          <strong>Dictation shortcut</strong>
-          <span class="muted">Click the button, then press and release the shortcut</span>
-        </div>
-        <button class="capture" id="capture-shortcut" type="button">Ctrl + Win</button>
+        <div class="binding-label"><strong>Dictation</strong></div>
+        <button class="capture" id="capture-shortcut" type="button" title="Click, then press your dictation shortcut">Ctrl + Win</button>
       </div>
       <div id="wispr-shortcuts" hidden>
         <div class="binding">
-          <div class="binding-label">
-            <strong>Hands-free shortcut</strong>
-            <span class="muted">Match Wispr Flow's hands-free shortcut. Default: Ctrl + Win + Space.</span>
-          </div>
-          <button class="capture" id="capture-hands-free" type="button">Ctrl + Win + Space</button>
+          <div class="binding-label"><strong>Hands-free</strong></div>
+          <button class="capture" id="capture-hands-free" type="button" title="Click, then press your hands-free shortcut">Ctrl + Win + Space</button>
         </div>
-        <p class="muted">Escape cancels dictation and restores Discord. Use shortcuts to start and stop; clicking Flow's controls is not detected.</p>
       </div>
+      <div class="binding">
+        <div class="binding-label"><strong>Mode</strong></div>
+        <div class="segment" id="mode-segment">
+          <button type="button" data-mode="auto" title="Hold to dictate; double-tap to lock">Auto</button>
+          <button type="button" data-mode="hold">Hold</button>
+          <button type="button" data-mode="toggle">Toggle</button>
+        </div>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Soundboard</h2>
+      <div class="field">
+        <label for="soundboard-sound-id">Sound ID</label>
+        <input id="soundboard-sound-id" type="text" inputmode="numeric" spellcheck="false" autocomplete="off" placeholder="Optional" />
+      </div>
+      <div class="field">
+        <label for="soundboard-guild-ids">Allowed guilds</label>
+        <textarea id="soundboard-guild-ids" rows="3" spellcheck="false" autocomplete="off" aria-describedby="guilds-help"></textarea>
+      </div>
+      <p class="muted" id="guilds-help">One ID per line. Empty disables sounds.</p>
     </section>
 
     <section class="card">
       <h2>Behavior</h2>
       <div class="binding">
         <div class="binding-label">
-          <strong>Shortcut mode</strong>
-          <span class="muted" id="mode-help">Auto: hold to dictate, double-tap to lock, tap again to stop.</span>
-        </div>
-        <div class="segment" id="mode-segment">
-          <button type="button" data-mode="auto">Auto</button>
-          <button type="button" data-mode="hold">Hold only</button>
-          <button type="button" data-mode="toggle">Toggle</button>
-        </div>
-      </div>
-      <div class="binding">
-        <div class="binding-label">
           <strong>Unmute delay</strong>
-          <span class="muted"><span id="delay-value">0</span> ms after dictation stops</span>
+          <span class="muted"><span id="delay-value">0</span> ms</span>
         </div>
-        <input id="delay" type="range" min="0" max="500" step="50" value="0" />
-      </div>
-      <div class="field">
-        <label for="soundboard-sound-id">Soundboard announcement (optional)</label>
-        <input id="soundboard-sound-id" type="text" inputmode="numeric" spellcheck="false" autocomplete="off" placeholder="1328911757753712702" />
-        <p class="muted">Paste a sound ID to play it once when dictation starts. Mute and sound requests are sent back-to-back. If deafening is on, it follows a short 100 ms pause after the sound request so Discord can start sending the clip. The bridge does not wait for the whole clip. Requires access to the sound in your current voice channel.</p>
+        <input id="delay" type="range" min="0" max="500" step="50" value="0" aria-label="Unmute delay" />
       </div>
       <div class="perm-row">
-        <span><strong>Deafen while dictating</strong><span class="muted"> — also block incoming Discord audio</span></span>
+        <strong>Deafen while dictating</strong>
         <input class="toggle-switch" id="deafen-while-active" type="checkbox" role="switch" aria-label="Deafen while dictating" />
       </div>
       <div class="perm-row">
-        <span><strong>Start with Windows</strong><span class="muted"> — run quietly in the notification area</span></span>
+        <strong>Start with Windows</strong>
         <input class="toggle-switch" id="launch-at-login" type="checkbox" role="switch" aria-label="Start with Windows" />
       </div>
     </section>
 
-    <div class="callout">
-      <strong>How it works:</strong> the bridge observes your dictation shortcuts, not your speech, audio, or typed text. Match the shortcuts in Willow Voice or Wispr Flow. Clicking dictation controls, automatic stops, and custom cancellation shortcuts are not detected; stop with the matching shortcut to keep Discord in sync.
-    </div>
-
-    <p class="err" id="error"></p>
+    <p class="err" id="error" hidden></p>
     <p class="version" id="version"></p>
   </main>
   <script type="module" src="renderer.js"></script>

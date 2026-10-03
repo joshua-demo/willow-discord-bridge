@@ -28,7 +28,7 @@ body { padding: 0 0 22px; }
 
 /* ---- Title bar drag region ---- */
 .drag { -webkit-app-region: drag; height: 28px; width: 100%; }
-button, input, a, .no-drag { -webkit-app-region: no-drag; }
+button, input, textarea, a, .no-drag { -webkit-app-region: no-drag; }
 
 /* ---- Hero ---- */
 .hero {
@@ -112,14 +112,15 @@ button { font: inherit; cursor: pointer; border: none; border-radius: var(--radi
 /* ---- Text inputs ---- */
 .field { display: flex; flex-direction: column; gap: 5px; margin-bottom: 11px; }
 .field label { font-size: 11.5px; font-weight: 560; color: var(--muted); }
-.field input {
+.field input, .field textarea {
   background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius-sm);
   color: var(--text); padding: 9px 11px; font-size: 13px; width: 100%;
   font-family: 'SF Mono', ui-monospace, Menlo, monospace; letter-spacing: .2px;
   user-select: text;
 }
-.field input:focus { outline: none; border-color: var(--primary); }
-.field input::placeholder { color: #55556a; }
+.field input:focus, .field textarea:focus { outline: none; border-color: var(--primary); }
+.field input::placeholder, .field textarea::placeholder { color: #55556a; }
+.field textarea { resize: vertical; line-height: 1.5; }
 
 /* ---- Segment ---- */
 .segment { display: inline-flex; background: var(--surface2); border-radius: var(--radius-sm); padding: 3px; }

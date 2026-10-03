@@ -40,7 +40,7 @@ impl Default for BridgeStatus {
 
 pub enum DiscordCommand {
     Connect,
-    PlaySound(String, mpsc::SyncSender<Result<(), String>>),
+    PlaySound(String, mpsc::SyncSender<Result<bool, String>>),
     SetMute(bool),
     RefreshActive,
     Shutdown,
@@ -58,6 +58,7 @@ pub fn start_worker(
         .spawn(move || {
             let mut client: Option<RpcClient> = None;
             let mut prior: Option<VoiceState> = None;
+            let mut applied: Option<VoiceState> = None;
             let mut owns_mute = false;
             let mut last_sound_attempt: Option<Instant> = None;
             let mut pending_deafen: Option<Instant> = None;
@@ -74,11 +75,16 @@ pub fn start_worker(
                         pending_deafen = None;
                         if owns_mute && store.get().deafen_while_active {
                             if let Some(rpc) = client.as_mut() {
-                                if let Err(error) = set_active_voice(rpc, prior, true) {
+                                let result = preserve_manual_voice(rpc, &mut prior, applied)
+                                    .and_then(|_| set_active_voice(rpc, prior, true));
+                                if let Err(error) = result {
                                     client = None;
                                     prior = None;
+                                    applied = None;
                                     owns_mute = false;
                                     set_rpc_status(&status, RpcState::Disconnected, Some(error));
+                                } else {
+                                    applied = active_voice_state(prior, true);
                                 }
                             }
                         }
@@ -92,10 +98,11 @@ pub fn start_worker(
                             if client.is_none() {
                                 client = Some(connect_authenticated(&store)?);
                             }
-                            client
-                                .as_mut()
-                                .expect("connected")
-                                .play_soundboard_sound(&sound_id)
+                            play_allowed_sound(
+                                client.as_mut().expect("connected"),
+                                &sound_id,
+                                &store.get().soundboard_guild_ids,
+                            )
                         })();
                         // Playback never changes mute/deafen state or retries a sound: a
                         // lost reply could otherwise cause duplicate playback.
@@ -121,6 +128,7 @@ pub fn start_worker(
                             Ok(next) => {
                                 client = Some(next);
                                 prior = None;
+                                applied = None;
                                 owns_mute = false;
                                 pending_deafen = None;
                                 set_rpc_status(&status, RpcState::Connected, None);
@@ -135,56 +143,70 @@ pub fn start_worker(
                     DiscordCommand::SetMute(on) => {
                         let Some(rpc) = client.as_mut() else { continue };
                         let result = if on {
-                            let first_activation = !owns_mute;
-                            if first_activation {
-                                prior = rpc.get_voice_settings().ok();
-                                owns_mute = true;
-                            }
-                            let config = store.get();
-                            let can_play = first_activation
-                                && prior.is_some_and(|state| !state.deaf)
-                                && !config.soundboard_sound_id.is_empty()
-                                && last_sound_attempt
-                                    .is_none_or(|last| last.elapsed() >= Duration::from_secs(5));
-                            if can_play {
-                                last_sound_attempt = Some(Instant::now());
-                                begin_announcement(
-                                    rpc,
-                                    prior,
-                                    &config.soundboard_sound_id,
-                                    config.deafen_while_active,
-                                )
-                                .map(|announcement| {
-                                    pending_deafen = announcement.deafen_at;
-                                    set_rpc_status(
-                                        &status,
-                                        RpcState::Connected,
-                                        announcement
-                                            .sound_error
-                                            .map(|error| format!("Soundboard: {error}")),
+                            (|| {
+                                let first_activation = !owns_mute;
+                                if first_activation {
+                                    prior = rpc.get_voice_settings().ok();
+                                    applied = prior;
+                                    owns_mute = true;
+                                } else {
+                                    preserve_manual_voice(rpc, &mut prior, applied)?;
+                                }
+                                let config = store.get();
+                                let can_play = first_activation
+                                    && prior.is_some_and(|state| !state.deaf)
+                                    && !config.soundboard_sound_id.is_empty()
+                                    && last_sound_attempt.is_none_or(|last| {
+                                        last.elapsed() >= Duration::from_secs(5)
+                                    });
+                                let result = if can_play {
+                                    begin_announcement(
+                                        rpc,
+                                        prior,
+                                        &config.soundboard_sound_id,
+                                        config.deafen_while_active,
+                                        &config.soundboard_guild_ids,
+                                    )
+                                    .map(|announcement| {
+                                        if announcement.sound_attempted {
+                                            last_sound_attempt = Some(Instant::now());
+                                        }
+                                        pending_deafen = announcement.deafen_at;
+                                        set_rpc_status(
+                                            &status,
+                                            RpcState::Connected,
+                                            announcement
+                                                .sound_error
+                                                .map(|error| format!("Soundboard: {error}")),
+                                        );
+                                    })
+                                } else {
+                                    set_active_voice(
+                                        rpc,
+                                        prior,
+                                        config.deafen_while_active && pending_deafen.is_none(),
+                                    )
+                                };
+                                if result.is_ok() {
+                                    applied = active_voice_state(
+                                        prior,
+                                        config.deafen_while_active && pending_deafen.is_none(),
                                     );
-                                })
-                            } else {
-                                set_active_voice(
-                                    rpc,
-                                    prior,
-                                    config.deafen_while_active && pending_deafen.is_none(),
-                                )
-                            }
+                                }
+                                result
+                            })()
                         } else {
                             if !owns_mute {
                                 continue;
                             }
                             owns_mute = false;
                             pending_deafen = None;
-                            match prior.take() {
-                                Some(state) => rpc.set_voice_settings(state.mute, Some(state.deaf)),
-                                None => Ok(()), // fail closed rather than accidentally unmuting
-                            }
+                            restore_voice(rpc, prior.take(), applied.take())
                         };
                         if let Err(error) = result {
                             client = None;
                             prior = None;
+                            applied = None;
                             owns_mute = false;
                             pending_deafen = None;
                             set_rpc_status(&status, RpcState::Disconnected, Some(error));
@@ -199,22 +221,24 @@ pub fn start_worker(
                         if !config.deafen_while_active || config.soundboard_sound_id.is_empty() {
                             pending_deafen = None;
                         }
-                        if let Err(error) = set_active_voice(
-                            rpc,
-                            prior,
-                            config.deafen_while_active && pending_deafen.is_none(),
-                        ) {
+                        let deafen = config.deafen_while_active && pending_deafen.is_none();
+                        let result = preserve_manual_voice(rpc, &mut prior, applied)
+                            .and_then(|_| set_active_voice(rpc, prior, deafen));
+                        if let Err(error) = result {
                             client = None;
                             prior = None;
+                            applied = None;
                             owns_mute = false;
                             pending_deafen = None;
                             set_rpc_status(&status, RpcState::Disconnected, Some(error));
+                        } else {
+                            applied = active_voice_state(prior, deafen);
                         }
                     }
                     DiscordCommand::Shutdown => {
                         if owns_mute {
-                            if let (Some(rpc), Some(state)) = (client.as_mut(), prior.take()) {
-                                let _ = rpc.set_voice_settings(state.mute, Some(state.deaf));
+                            if let Some(rpc) = client.as_mut() {
+                                let _ = restore_voice(rpc, prior.take(), applied.take());
                             }
                         }
                         break;
@@ -227,6 +251,8 @@ pub fn start_worker(
 }
 
 trait VoiceControl {
+    fn get_voice_settings(&mut self) -> Result<VoiceState, String>;
+    fn soundboard_allowed(&mut self, guild_ids: &[String]) -> Result<bool, String>;
     fn set_voice_settings(&mut self, mute: bool, deaf: Option<bool>) -> Result<(), String>;
     fn play_soundboard_sound(&mut self, sound_id: &str) -> Result<(), String>;
 
@@ -240,8 +266,22 @@ trait VoiceControl {
     }
 }
 
+// Used by standalone/MIDI playback as well as the dictation announcement gate.
+fn play_allowed_sound(
+    rpc: &mut impl VoiceControl,
+    sound_id: &str,
+    guild_ids: &[String],
+) -> Result<bool, String> {
+    if !rpc.soundboard_allowed(guild_ids)? {
+        return Ok(false);
+    }
+    rpc.play_soundboard_sound(sound_id)?;
+    Ok(true)
+}
+
 struct Announcement {
     sound_error: Option<String>,
+    sound_attempted: bool,
     deafen_at: Option<Instant>,
 }
 
@@ -250,7 +290,19 @@ fn begin_announcement(
     prior: Option<VoiceState>,
     sound_id: &str,
     deafen_while_active: bool,
+    guild_ids: &[String],
 ) -> Result<Announcement, String> {
+    let allowed = rpc.soundboard_allowed(guild_ids);
+    if !matches!(allowed, Ok(true)) {
+        // A different guild, DM, no call, or failed lookup must never block mute/deafen.
+        // No sound was requested, so there is no need for the playback grace period.
+        set_active_voice(rpc, prior, deafen_while_active)?;
+        return Ok(Announcement {
+            sound_error: allowed.err(),
+            sound_attempted: false,
+            deafen_at: None,
+        });
+    }
     // The RPC reply accepts the request but doesn't confirm audio has started.
     // Send mute and sound back-to-back, then briefly leave receive audio on so
     // Discord can send the sound before deafening. Release stays responsive.
@@ -266,6 +318,7 @@ fn begin_announcement(
     };
     Ok(Announcement {
         sound_error,
+        sound_attempted: true,
         deafen_at,
     })
 }
@@ -283,6 +336,57 @@ fn set_active_voice(
     rpc.set_voice_settings(true, deaf)
 }
 
+fn active_voice_state(prior: Option<VoiceState>, deafen: bool) -> Option<VoiceState> {
+    prior.map(|state| VoiceState {
+        mute: true,
+        deaf: state.deaf || deafen,
+    })
+}
+
+fn preserved_voice(prior: VoiceState, applied: VoiceState, current: VoiceState) -> VoiceState {
+    let manual_deaf = current.deaf != applied.deaf;
+    VoiceState {
+        // A manual deafen may also mute. Keep both instead of opening the mic.
+        mute: prior.mute
+            || if current.mute != applied.mute || (manual_deaf && current.deaf) {
+                current.mute
+            } else {
+                false
+            },
+        // Starting restrictions are sticky: a later snapshot must never clear them.
+        deaf: prior.deaf || (manual_deaf && current.deaf),
+    }
+}
+
+fn preserve_manual_voice(
+    rpc: &mut impl VoiceControl,
+    prior: &mut Option<VoiceState>,
+    applied: Option<VoiceState>,
+) -> Result<(), String> {
+    if let (Some(before), Some(last)) = (*prior, applied) {
+        let current = rpc.get_voice_settings()?;
+        let preserved = preserved_voice(before, last, current);
+        #[cfg(debug_assertions)]
+        eprintln!(
+            "voice preserve prior={before:?} applied={last:?} current={current:?} restore={preserved:?}"
+        );
+        *prior = Some(preserved);
+    }
+    Ok(())
+}
+
+fn restore_voice(
+    rpc: &mut impl VoiceControl,
+    mut prior: Option<VoiceState>,
+    applied: Option<VoiceState>,
+) -> Result<(), String> {
+    preserve_manual_voice(rpc, &mut prior, applied)?;
+    if let Some(state) = prior {
+        rpc.set_voice_settings(state.mute, Some(state.deaf))?;
+    }
+    Ok(()) // Unknown initial state: never guess that unmuting is safe.
+}
+
 fn set_rpc_status(status: &Mutex<BridgeStatus>, rpc: RpcState, error: Option<String>) {
     if let Ok(mut status) = status.lock() {
         status.rpc = rpc;
@@ -290,7 +394,7 @@ fn set_rpc_status(status: &Mutex<BridgeStatus>, rpc: RpcState, error: Option<Str
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct VoiceState {
     mute: bool,
     deaf: bool,
@@ -300,6 +404,7 @@ struct RpcClient<T = File> {
     pipe: T,
     nonce: u64,
     soundboard_args: HashMap<String, Value>,
+    user_id: Option<String>,
 }
 
 impl RpcClient<File> {
@@ -316,6 +421,7 @@ impl RpcClient<File> {
             pipe: pipe.ok_or("Discord desktop RPC pipe was not found")?,
             nonce: 0,
             soundboard_args: HashMap::new(),
+            user_id: None,
         };
         client.write_frame(0, &json!({ "v": 1, "client_id": client_id }))?;
         loop {
@@ -382,15 +488,53 @@ impl<T: Read + Write> RpcClient<T> {
     }
 
     fn authenticate(&mut self, token: &str) -> Result<(), String> {
-        self.request("AUTHENTICATE", json!({ "access_token": token }))
-            .map(|_| ())
+        let data = self.request("AUTHENTICATE", json!({ "access_token": token }))?;
+        self.user_id = Some(
+            data.pointer("/user/id")
+                .and_then(Value::as_str)
+                .ok_or("Discord did not identify the signed-in account")?
+                .into(),
+        );
+        Ok(())
+    }
+
+    fn soundboard_allowed(&mut self, guild_ids: &[String]) -> Result<bool, String> {
+        if guild_ids.is_empty() {
+            return Ok(false);
+        }
+        // Check the current voice destination, not the sound's source guild.
+        // Don't cache this: the user can switch calls between shortcut presses.
+        let channel = self.request("GET_SELECTED_VOICE_CHANNEL", json!({}))?;
+        Ok(channel
+            .get("guild_id")
+            .and_then(Value::as_str)
+            .is_some_and(|guild| guild_ids.iter().any(|id| id == guild)))
     }
 
     fn get_voice_settings(&mut self) -> Result<VoiceState, String> {
+        if let Some(user_id) = self.user_id.clone() {
+            let channel = self.request("GET_SELECTED_VOICE_CHANNEL", json!({}))?;
+            if !channel.is_null() {
+                let state = own_channel_voice_state(&channel, &user_id)?;
+                #[cfg(debug_assertions)]
+                eprintln!(
+                    "voice snapshot source=channel mute={} deaf={}",
+                    state.mute, state.deaf
+                );
+                return Ok(state);
+            }
+        }
+        // Outside a call there is no channel voice state to inspect.
         let data = self.request("GET_VOICE_SETTINGS", json!({}))?;
         Ok(VoiceState {
-            mute: data.get("mute").and_then(Value::as_bool).unwrap_or(false),
-            deaf: data.get("deaf").and_then(Value::as_bool).unwrap_or(false),
+            mute: data
+                .get("mute")
+                .and_then(Value::as_bool)
+                .ok_or("Discord did not return a mute state")?,
+            deaf: data
+                .get("deaf")
+                .and_then(Value::as_bool)
+                .ok_or("Discord did not return a deafen state")?,
         })
     }
 
@@ -490,6 +634,14 @@ impl<T: Read + Write> RpcClient<T> {
 }
 
 impl<T: Read + Write> VoiceControl for RpcClient<T> {
+    fn get_voice_settings(&mut self) -> Result<VoiceState, String> {
+        RpcClient::get_voice_settings(self)
+    }
+
+    fn soundboard_allowed(&mut self, guild_ids: &[String]) -> Result<bool, String> {
+        RpcClient::soundboard_allowed(self, guild_ids)
+    }
+
     fn set_voice_settings(&mut self, mute: bool, deaf: Option<bool>) -> Result<(), String> {
         RpcClient::set_voice_settings(self, mute, deaf)
     }
@@ -602,6 +754,29 @@ fn exchange_token(
         .map_err(|error| error.to_string())
 }
 
+fn own_channel_voice_state(channel: &Value, user_id: &str) -> Result<VoiceState, String> {
+    let state = channel
+        .get("voice_states")
+        .and_then(Value::as_array)
+        .and_then(|states| {
+            states
+                .iter()
+                .find(|state| state.pointer("/user/id").and_then(Value::as_str) == Some(user_id))
+        })
+        .and_then(|state| state.get("voice_state"))
+        .ok_or("Discord did not return your channel voice state")?;
+    Ok(VoiceState {
+        mute: state
+            .get("self_mute")
+            .and_then(Value::as_bool)
+            .ok_or("Discord did not return your self-mute state")?,
+        deaf: state
+            .get("self_deaf")
+            .and_then(Value::as_bool)
+            .ok_or("Discord did not return your self-deafen state")?,
+    })
+}
+
 fn soundboard_args(sounds: &Value, sound_id: &str) -> Result<Value, String> {
     let sound = sounds
         .as_array()
@@ -644,20 +819,45 @@ fn now_ms() -> u64 {
 mod tests {
     use super::*;
 
+    const SOUNDBOARD_GUILD_ID: &str = "1539407179117760542";
+
+    fn allowed_guilds() -> Vec<String> {
+        vec![SOUNDBOARD_GUILD_ID.into()]
+    }
+
     #[derive(Default)]
     struct FakeVoice {
         calls: Vec<Value>,
         sound_error: Option<String>,
+        guild_check: Option<Result<bool, String>>,
         mute_error: bool,
         deafen_error: bool,
+        current: Option<VoiceState>,
     }
 
     impl VoiceControl for FakeVoice {
+        fn get_voice_settings(&mut self) -> Result<VoiceState, String> {
+            self.current.ok_or("Voice state unavailable".into())
+        }
+
+        fn soundboard_allowed(&mut self, guild_ids: &[String]) -> Result<bool, String> {
+            if guild_ids.is_empty() {
+                return Ok(false);
+            }
+            self.guild_check.clone().unwrap_or(Ok(true))
+        }
+
         fn set_voice_settings(&mut self, mute: bool, deaf: Option<bool>) -> Result<(), String> {
             self.calls.push(json!({ "mute": mute, "deaf": deaf }));
             if (deaf == Some(true) && self.deafen_error) || (deaf != Some(true) && self.mute_error)
             {
                 return Err("Voice settings failed".into());
+            }
+            if let Some(current) = self.current.as_mut() {
+                current.mute = mute;
+                if let Some(deaf) = deaf {
+                    current.deaf = deaf;
+                }
             }
             Ok(())
         }
@@ -674,13 +874,16 @@ mod tests {
     struct TestPipe {
         incoming: std::io::Cursor<Vec<u8>>,
         outgoing: Vec<u8>,
+        minimum_requests: usize,
     }
 
     impl Read for TestPipe {
         fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
             // Enforce pipelining at the transport, not just in the voice mock.
             let requests = decoded_frames(&self.outgoing);
-            assert!(requests.iter().filter(|(opcode, _)| *opcode == 1).count() >= 2);
+            assert!(
+                requests.iter().filter(|(opcode, _)| *opcode == 1).count() >= self.minimum_requests
+            );
             self.incoming.read(bytes)
         }
     }
@@ -729,12 +932,14 @@ mod tests {
             pipe: TestPipe {
                 incoming: std::io::Cursor::new(encoded_frames(frames)),
                 outgoing: Vec::new(),
+                minimum_requests: 2,
             },
             nonce: 0,
             soundboard_args: HashMap::from([(
                 "123".into(),
                 json!({ "sound_id": "123", "guild_id": "456" }),
             )]),
+            user_id: None,
         }
     }
 
@@ -789,13 +994,18 @@ mod tests {
     #[test]
     fn announcement_pipelines_mute_and_sound_then_schedules_a_short_deafen_grace() {
         let mut rpc = scripted_rpc(&[
-            (1, json!({ "nonce": "2", "data": null })),
-            (1, json!({ "nonce": "1", "data": { "mute": true } })),
             (
                 1,
-                json!({ "nonce": "3", "data": { "mute": true, "deaf": true } }),
+                json!({ "nonce": "1", "data": { "id": "789", "guild_id": SOUNDBOARD_GUILD_ID } }),
+            ),
+            (1, json!({ "nonce": "3", "data": null })),
+            (1, json!({ "nonce": "2", "data": { "mute": true } })),
+            (
+                1,
+                json!({ "nonce": "4", "data": { "mute": true, "deaf": true } }),
             ),
         ]);
+        rpc.pipe.minimum_requests = 1;
         let before = Instant::now();
         let result = begin_announcement(
             &mut rpc,
@@ -805,20 +1015,167 @@ mod tests {
             }),
             "123",
             true,
+            &allowed_guilds(),
         )
         .unwrap();
         let after = Instant::now();
         assert!(result.sound_error.is_none());
+        assert!(result.sound_attempted);
         let deadline = result.deafen_at.unwrap();
         assert!(deadline >= before + Duration::from_millis(100));
         assert!(deadline <= after + Duration::from_millis(100));
         let frames = decoded_frames(&rpc.pipe.outgoing);
-        assert_eq!(frames.len(), 2);
-        assert_eq!(frames[0].1["cmd"], "SET_VOICE_SETTINGS");
-        assert_eq!(frames[1].1["cmd"], "PLAY_SOUNDBOARD_SOUND");
+        assert_eq!(frames.len(), 3);
+        assert_eq!(frames[0].1["cmd"], "GET_SELECTED_VOICE_CHANNEL");
+        assert_eq!(frames[1].1["cmd"], "SET_VOICE_SETTINGS");
+        assert_eq!(frames[2].1["cmd"], "PLAY_SOUNDBOARD_SOUND");
         set_active_voice(&mut rpc, None, true).unwrap();
         let frames = decoded_frames(&rpc.pipe.outgoing);
-        assert_eq!(frames[2].1["args"], json!({ "mute": true, "deaf": true }));
+        assert_eq!(frames[3].1["args"], json!({ "mute": true, "deaf": true }));
+    }
+
+    #[test]
+    fn soundboard_scope_checks_current_voice_guild_on_every_attempt() {
+        let channels = [
+            json!({ "id": "789", "guild_id": SOUNDBOARD_GUILD_ID }),
+            json!({ "id": "987", "guild_id": "456" }), // Sound source guild is not the destination.
+            Value::Null,                               // No voice connection.
+            json!({ "id": "789", "type": 3 }),         // Group DM.
+            json!({ "id": "789", "guild_id": null }),
+            json!({ "id": "789", "guild_id": 1539407179117760542_u64 }),
+        ];
+        let frames: Vec<_> = channels
+            .iter()
+            .enumerate()
+            .map(|(i, channel)| (1, json!({ "nonce": (i + 1).to_string(), "data": channel })))
+            .collect();
+        let mut rpc = scripted_rpc(&frames);
+        rpc.pipe.minimum_requests = 1;
+        for i in 0..channels.len() {
+            assert_eq!(rpc.soundboard_allowed(&allowed_guilds()), Ok(i == 0));
+        }
+        for (_, request) in decoded_frames(&rpc.pipe.outgoing) {
+            assert_eq!(request["cmd"], "GET_SELECTED_VOICE_CHANNEL");
+            assert_eq!(request["args"], json!({}));
+        }
+    }
+
+    #[test]
+    fn guild_allowlist_changes_apply_to_the_next_attempt() {
+        let mut rpc = scripted_rpc(&[
+            (
+                1,
+                json!({ "nonce": "1", "data": { "guild_id": "1322604750080053409" } }),
+            ),
+            (
+                1,
+                json!({ "nonce": "2", "data": { "guild_id": "1322604750080053409" } }),
+            ),
+            (
+                1,
+                json!({ "nonce": "3", "data": { "guild_id": SOUNDBOARD_GUILD_ID } }),
+            ),
+        ]);
+        rpc.pipe.minimum_requests = 1;
+        assert_eq!(rpc.soundboard_allowed(&allowed_guilds()), Ok(false));
+        let mut guilds = allowed_guilds();
+        guilds.push("1322604750080053409".into());
+        assert_eq!(rpc.soundboard_allowed(&guilds), Ok(true));
+        guilds.retain(|id| id != SOUNDBOARD_GUILD_ID);
+        assert_eq!(rpc.soundboard_allowed(&guilds), Ok(false));
+    }
+
+    #[test]
+    fn empty_allowlist_skips_lookup_and_playback_without_blocking_mute() {
+        let mut rpc = scripted_rpc(&[]);
+        assert_eq!(rpc.soundboard_allowed(&[]), Ok(false));
+        assert_eq!(play_allowed_sound(&mut rpc, "123", &[]), Ok(false));
+        assert!(rpc.pipe.outgoing.is_empty());
+        for deafen in [false, true] {
+            let mut voice = FakeVoice::default();
+            let result = begin_announcement(
+                &mut voice,
+                Some(VoiceState {
+                    mute: false,
+                    deaf: false,
+                }),
+                "123",
+                deafen,
+                &[],
+            )
+            .unwrap();
+            assert!(!result.sound_attempted);
+            assert!(result.deafen_at.is_none());
+            assert_eq!(voice.calls, vec![json!({ "mute": true, "deaf": deafen })]);
+        }
+    }
+
+    #[test]
+    fn outside_soundboard_guild_mute_and_deafen_still_work_without_grace() {
+        for deafen in [false, true] {
+            let mut rpc = scripted_rpc(&[
+                (
+                    1,
+                    json!({ "nonce": "1", "data": { "id": "789", "guild_id": "other-guild" } }),
+                ),
+                (1, json!({ "nonce": "2", "data": {} })),
+            ]);
+            rpc.pipe.minimum_requests = 1;
+            let result = begin_announcement(
+                &mut rpc,
+                Some(VoiceState {
+                    mute: false,
+                    deaf: false,
+                }),
+                "123",
+                deafen,
+                &allowed_guilds(),
+            )
+            .unwrap();
+            assert!(result.sound_error.is_none());
+            assert!(!result.sound_attempted);
+            assert!(result.deafen_at.is_none());
+            let frames = decoded_frames(&rpc.pipe.outgoing);
+            assert_eq!(frames.len(), 2);
+            assert_eq!(frames[1].1["cmd"], "SET_VOICE_SETTINGS");
+            assert_eq!(frames[1].1["args"], json!({ "mute": true, "deaf": deafen }));
+        }
+    }
+
+    #[test]
+    fn failed_guild_lookup_skips_sound_but_does_not_block_mute_or_deafen() {
+        let mut rpc = scripted_rpc(&[
+            (
+                1,
+                json!({ "nonce": "1", "evt": "ERROR", "data": { "message": "Lookup failed" } }),
+            ),
+            (1, json!({ "nonce": "2", "data": {} })),
+        ]);
+        rpc.pipe.minimum_requests = 1;
+        let result = begin_announcement(&mut rpc, None, "123", true, &allowed_guilds()).unwrap();
+        assert_eq!(result.sound_error, Some("Lookup failed".into()));
+        assert!(!result.sound_attempted);
+        assert!(result.deafen_at.is_none());
+        let frames = decoded_frames(&rpc.pipe.outgoing);
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[1].1["args"], json!({ "mute": true, "deaf": true }));
+    }
+
+    #[test]
+    fn standalone_sound_only_plays_when_guild_is_confirmed() {
+        for allowed in [Ok(true), Ok(false), Err("Lookup failed".into())] {
+            let mut rpc = FakeVoice {
+                guild_check: Some(allowed.clone()),
+                ..FakeVoice::default()
+            };
+            assert_eq!(
+                play_allowed_sound(&mut rpc, "123", &allowed_guilds()),
+                allowed.clone()
+            );
+            assert_eq!(rpc.calls.len(), usize::from(allowed == Ok(true)));
+            // MIDI sound gating must never change voice settings.
+            assert!(rpc.calls.iter().all(|call| call.get("sound_id").is_some()));
+        }
     }
 
     #[test]
@@ -827,7 +1184,7 @@ mod tests {
             sound_error: Some("Invalid Sound".into()),
             ..FakeVoice::default()
         };
-        let result = begin_announcement(&mut rpc, None, "123", true).unwrap();
+        let result = begin_announcement(&mut rpc, None, "123", true, &allowed_guilds()).unwrap();
         assert_eq!(result.sound_error, Some("Invalid Sound".into()));
         assert!(result.deafen_at.is_none());
         assert_eq!(
@@ -839,7 +1196,7 @@ mod tests {
     #[test]
     fn announcement_does_not_deafen_when_disabled() {
         let mut rpc = FakeVoice::default();
-        let result = begin_announcement(&mut rpc, None, "123", false).unwrap();
+        let result = begin_announcement(&mut rpc, None, "123", false, &allowed_guilds()).unwrap();
         assert!(result.sound_error.is_none());
         assert!(result.deafen_at.is_none());
         assert_eq!(
@@ -857,7 +1214,7 @@ mod tests {
             mute_error: true,
             ..FakeVoice::default()
         };
-        assert!(begin_announcement(&mut rpc, None, "123", true).is_err());
+        assert!(begin_announcement(&mut rpc, None, "123", true, &allowed_guilds()).is_err());
         assert_eq!(rpc.calls.len(), 1);
     }
 
@@ -868,7 +1225,7 @@ mod tests {
             ..FakeVoice::default()
         };
         assert!(
-            begin_announcement(&mut rpc, None, "123", true)
+            begin_announcement(&mut rpc, None, "123", true, &allowed_guilds())
                 .unwrap()
                 .deafen_at
                 .is_some()
@@ -878,6 +1235,287 @@ mod tests {
             Err("Voice settings failed".into())
         );
         assert_eq!(rpc.calls.len(), 3);
+    }
+
+    #[test]
+    fn restore_keeps_each_starting_voice_state_with_auto_deafen_on_or_off() {
+        for mute in [false, true] {
+            for deaf in [false, true] {
+                for auto_deafen in [false, true] {
+                    let prior = VoiceState { mute, deaf };
+                    let applied = active_voice_state(Some(prior), auto_deafen);
+                    let mut rpc = FakeVoice {
+                        current: applied,
+                        ..FakeVoice::default()
+                    };
+                    restore_voice(&mut rpc, Some(prior), applied).unwrap();
+                    assert_eq!(rpc.current, Some(prior));
+                    assert_eq!(rpc.calls, vec![json!({ "mute": mute, "deaf": deaf })]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn manual_deafen_during_mute_only_is_kept_on_stop() {
+        let prior = VoiceState {
+            mute: false,
+            deaf: false,
+        };
+        let applied = active_voice_state(Some(prior), false);
+        let mut rpc = FakeVoice {
+            current: Some(VoiceState {
+                mute: true,
+                deaf: true,
+            }),
+            ..FakeVoice::default()
+        };
+        restore_voice(&mut rpc, Some(prior), applied).unwrap();
+        assert_eq!(rpc.calls, vec![json!({ "mute": true, "deaf": true })]);
+    }
+
+    #[test]
+    fn settings_refresh_does_not_undo_manual_deafen() {
+        let mut prior = Some(VoiceState {
+            mute: false,
+            deaf: false,
+        });
+        let mut applied = active_voice_state(prior, false);
+        let mut rpc = FakeVoice {
+            current: Some(VoiceState {
+                mute: true,
+                deaf: true,
+            }),
+            ..FakeVoice::default()
+        };
+        preserve_manual_voice(&mut rpc, &mut prior, applied).unwrap();
+        set_active_voice(&mut rpc, prior, false).unwrap();
+        applied = active_voice_state(prior, false);
+        restore_voice(&mut rpc, prior, applied).unwrap();
+        assert_eq!(
+            rpc.current,
+            Some(VoiceState {
+                mute: true,
+                deaf: true
+            })
+        );
+        assert!(
+            rpc.calls
+                .iter()
+                .all(|call| call["mute"] == true && call["deaf"] == true)
+        );
+    }
+
+    #[test]
+    fn manual_deafen_during_sound_grace_is_not_owned_by_the_bridge() {
+        let mut prior = Some(VoiceState {
+            mute: false,
+            deaf: false,
+        });
+        let applied = active_voice_state(prior, false);
+        let mut rpc = FakeVoice {
+            current: Some(VoiceState {
+                mute: true,
+                deaf: true,
+            }),
+            ..FakeVoice::default()
+        };
+        preserve_manual_voice(&mut rpc, &mut prior, applied).unwrap();
+        set_active_voice(&mut rpc, prior, true).unwrap();
+        restore_voice(&mut rpc, prior, active_voice_state(prior, true)).unwrap();
+        assert_eq!(
+            rpc.current,
+            Some(VoiceState {
+                mute: true,
+                deaf: true
+            })
+        );
+    }
+
+    #[test]
+    fn disabling_auto_deafen_releases_only_the_bridges_deafen() {
+        for already_deaf in [false, true] {
+            let mut prior = Some(VoiceState {
+                mute: false,
+                deaf: already_deaf,
+            });
+            let applied = active_voice_state(prior, true);
+            let mut rpc = FakeVoice {
+                current: applied,
+                ..FakeVoice::default()
+            };
+            preserve_manual_voice(&mut rpc, &mut prior, applied).unwrap();
+            set_active_voice(&mut rpc, prior, false).unwrap();
+            assert_eq!(
+                rpc.current,
+                Some(VoiceState {
+                    mute: true,
+                    deaf: already_deaf
+                })
+            );
+            restore_voice(&mut rpc, prior, active_voice_state(prior, false)).unwrap();
+            assert_eq!(
+                rpc.current,
+                Some(VoiceState {
+                    mute: false,
+                    deaf: already_deaf
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn starting_mute_and_deafen_cannot_be_cleared_by_later_snapshots() {
+        for mute in [false, true] {
+            for deaf in [false, true] {
+                let prior = VoiceState { mute, deaf };
+                let mut rpc = FakeVoice {
+                    current: Some(VoiceState {
+                        mute: false,
+                        deaf: false,
+                    }),
+                    ..FakeVoice::default()
+                };
+                restore_voice(&mut rpc, Some(prior), active_voice_state(Some(prior), true))
+                    .unwrap();
+                assert_eq!(rpc.current, Some(prior));
+            }
+        }
+    }
+
+    fn channel_state(mute: bool, deaf: bool) -> Value {
+        json!({ "id": "channel", "voice_states": [
+            { "user": { "id": "someone-else" }, "voice_state": { "self_mute": false, "self_deaf": false } },
+            { "user": { "id": "self" }, "voice_state": { "self_mute": mute, "self_deaf": deaf, "mute": false, "deaf": false } }
+        ] })
+    }
+
+    #[test]
+    fn authenticated_snapshot_uses_own_channel_self_state() {
+        let mut rpc = scripted_rpc(&[(
+            1,
+            json!({ "nonce": "1", "data": channel_state(true, true) }),
+        )]);
+        rpc.user_id = Some("self".into());
+        rpc.pipe.minimum_requests = 1;
+        assert_eq!(
+            rpc.get_voice_settings(),
+            Ok(VoiceState {
+                mute: true,
+                deaf: true
+            })
+        );
+        let frames = decoded_frames(&rpc.pipe.outgoing);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].1["cmd"], "GET_SELECTED_VOICE_CHANNEL");
+    }
+
+    #[test]
+    fn pre_deafened_channel_state_is_still_deafened_after_prompt_release() {
+        let mut rpc = scripted_rpc(&[
+            (
+                1,
+                json!({ "nonce": "1", "data": channel_state(false, true) }),
+            ),
+            (1, json!({ "nonce": "2", "data": {} })),
+            // Even a later false snapshot cannot erase the starting deafen.
+            (
+                1,
+                json!({ "nonce": "3", "data": channel_state(false, false) }),
+            ),
+            (1, json!({ "nonce": "4", "data": {} })),
+        ]);
+        rpc.user_id = Some("self".into());
+        rpc.pipe.minimum_requests = 1;
+        let prior = Some(rpc.get_voice_settings().unwrap());
+        assert!(prior.unwrap().deaf);
+        set_active_voice(&mut rpc, prior, false).unwrap();
+        restore_voice(&mut rpc, prior, active_voice_state(prior, false)).unwrap();
+        let frames = decoded_frames(&rpc.pipe.outgoing);
+        assert_eq!(frames[1].1["args"], json!({ "mute": true, "deaf": true }));
+        assert_eq!(frames[3].1["args"], json!({ "mute": false, "deaf": true }));
+    }
+
+    #[test]
+    fn channel_snapshot_does_not_confuse_server_mute_with_self_mute() {
+        let mut channel = channel_state(false, false);
+        channel["voice_states"][1]["voice_state"]["mute"] = json!(true);
+        channel["voice_states"][1]["voice_state"]["deaf"] = json!(true);
+        assert_eq!(
+            own_channel_voice_state(&channel, "self"),
+            Ok(VoiceState {
+                mute: false,
+                deaf: false
+            })
+        );
+        assert!(own_channel_voice_state(&channel, "missing-user").is_err());
+        channel["voice_states"][1]["voice_state"]["self_deaf"] = Value::Null;
+        assert!(own_channel_voice_state(&channel, "self").is_err());
+    }
+
+    #[test]
+    fn out_of_call_snapshot_falls_back_to_voice_settings() {
+        let mut rpc = scripted_rpc(&[
+            (1, json!({ "nonce": "1", "data": null })),
+            (
+                1,
+                json!({ "nonce": "2", "data": { "mute": true, "deaf": true } }),
+            ),
+        ]);
+        rpc.user_id = Some("self".into());
+        rpc.pipe.minimum_requests = 1;
+        assert_eq!(
+            rpc.get_voice_settings(),
+            Ok(VoiceState {
+                mute: true,
+                deaf: true
+            })
+        );
+        let frames = decoded_frames(&rpc.pipe.outgoing);
+        assert_eq!(frames[0].1["cmd"], "GET_SELECTED_VOICE_CHANNEL");
+        assert_eq!(frames[1].1["cmd"], "GET_VOICE_SETTINGS");
+    }
+
+    #[test]
+    fn authentication_records_the_account_for_channel_snapshot_matching() {
+        let mut rpc = scripted_rpc(&[(
+            1,
+            json!({ "nonce": "1", "data": { "user": { "id": "self" } } }),
+        )]);
+        rpc.pipe.minimum_requests = 1;
+        rpc.authenticate("test-token").unwrap();
+        assert_eq!(rpc.user_id.as_deref(), Some("self"));
+    }
+
+    #[test]
+    fn unknown_or_unreadable_voice_state_does_not_guess_an_unmute() {
+        let mut rpc = FakeVoice::default();
+        restore_voice(&mut rpc, None, None).unwrap();
+        assert!(rpc.calls.is_empty());
+        let prior = Some(VoiceState {
+            mute: false,
+            deaf: false,
+        });
+        assert!(restore_voice(&mut rpc, prior, active_voice_state(prior, false)).is_err());
+        assert!(rpc.calls.is_empty());
+    }
+
+    #[test]
+    fn rpc_voice_snapshot_requires_both_boolean_states() {
+        for data in [
+            json!({}),
+            json!({ "mute": false }),
+            json!({ "mute": "false", "deaf": false }),
+            json!({ "mute": false, "deaf": null }),
+        ] {
+            let mut rpc = scripted_rpc(&[(1, json!({ "nonce": "1", "data": data }))]);
+            rpc.pipe.minimum_requests = 1;
+            assert!(rpc.get_voice_settings().is_err());
+            assert_eq!(
+                decoded_frames(&rpc.pipe.outgoing)[0].1["cmd"],
+                "GET_VOICE_SETTINGS"
+            );
+        }
     }
 
     #[test]
@@ -891,6 +1529,7 @@ mod tests {
             pipe,
             nonce: 0,
             soundboard_args: HashMap::from([("123".into(), args.clone())]),
+            user_id: None,
         };
         assert_eq!(rpc.prepare_soundboard_sound("123"), Ok(args));
         assert_eq!(rpc.nonce, 0);

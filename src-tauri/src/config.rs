@@ -63,6 +63,10 @@ pub struct DiscordRpc {
     pub token_expires_at: Option<u64>,
 }
 
+fn default_soundboard_guild_ids() -> Vec<String> {
+    vec!["1539407179117760542".into()]
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Config {
@@ -77,6 +81,8 @@ pub struct Config {
     pub deafen_while_active: bool,
     #[serde(default)]
     pub soundboard_sound_id: String,
+    #[serde(default = "default_soundboard_guild_ids")]
+    pub soundboard_guild_ids: Vec<String>,
     pub unmute_delay_ms: u64,
     pub launch_at_login: bool,
 }
@@ -94,6 +100,7 @@ impl Default for Config {
             mode: Mode::Auto,
             deafen_while_active: false,
             soundboard_sound_id: String::new(),
+            soundboard_guild_ids: default_soundboard_guild_ids(),
             unmute_delay_ms: 0,
             launch_at_login: true,
         }
@@ -131,6 +138,11 @@ impl Config {
                     .all(|byte| byte.is_ascii_digit()))
         {
             return Err("Soundboard sound ID must contain only digits (up to 20)".into());
+        }
+        if self.soundboard_guild_ids.iter().any(|id| {
+            id.is_empty() || id.len() > 20 || !id.bytes().all(|byte| byte.is_ascii_digit())
+        }) {
+            return Err("Guild IDs must contain only digits (up to 20)".into());
         }
         Ok(())
     }
@@ -332,6 +344,7 @@ mod tests {
         let config: Config = serde_json::from_str(raw).expect("legacy config");
         assert!(!config.deafen_while_active);
         assert!(config.soundboard_sound_id.is_empty());
+        assert_eq!(config.soundboard_guild_ids, vec!["1539407179117760542"]);
         assert_eq!(config.dictation_app, DictationApp::Willow);
         assert_eq!(config.hands_free_shortcut.key, "VK_20");
     }
@@ -343,6 +356,58 @@ mod tests {
         assert!(config.validate().is_ok());
         config.hands_free_shortcut = config.shortcut.clone();
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn validates_soundboard_guild_ids() {
+        let mut config = Config::default();
+        config.soundboard_guild_ids =
+            vec!["1539407179117760542".into(), "1322604750080053409".into()];
+        assert!(config.validate().is_ok());
+        for invalid in [
+            "",
+            "not-a-guild",
+            "123,456",
+            "-1",
+            " 123",
+            "123456789012345678901",
+        ] {
+            config.soundboard_guild_ids = vec![invalid.into()];
+            assert!(config.validate().is_err(), "accepted {invalid:?}");
+        }
+        config.soundboard_guild_ids.clear();
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn empty_guild_allowlist_survives_serialization() {
+        let mut config = Config::default();
+        config.soundboard_guild_ids.clear();
+        let json = serde_json::to_string(&config).unwrap();
+        let loaded: Config = serde_json::from_str(&json).unwrap();
+        assert!(loaded.soundboard_guild_ids.is_empty());
+    }
+
+    #[test]
+    fn guild_allowlist_is_saved_and_reloaded() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "willow-guilds-{}-{suffix}.json",
+            std::process::id()
+        ));
+        let store = ConfigStore::load(path.clone());
+        let mut next = store.get();
+        next.soundboard_guild_ids = vec!["123".into(), "456".into()];
+        assert_eq!(
+            store.replace_public(next).unwrap().soundboard_guild_ids,
+            vec!["123", "456"]
+        );
+        let reloaded = ConfigStore::load(path.clone());
+        assert_eq!(reloaded.get().soundboard_guild_ids, vec!["123", "456"]);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

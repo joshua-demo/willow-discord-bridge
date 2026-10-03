@@ -168,8 +168,11 @@ pub fn start(path: PathBuf, discord: mpsc::Sender<DiscordCommand>) {
                                 break;
                             }
                             match result.recv_timeout(Duration::from_secs(10)) {
-                                Ok(Ok(())) => {
+                                Ok(Ok(true)) => {
                                     log(&format!("Played {} ({})", pad.name, pad.sound_id))
+                                }
+                                Ok(Ok(false)) => {
+                                    log(&format!("Skipped {}: guild not allowed", pad.name))
                                 }
                                 Ok(Err(error)) => log(&format!("{}: {error}", pad.name)),
                                 Err(_) => log("Discord playback timed out; not retried"),
