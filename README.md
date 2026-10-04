@@ -41,7 +41,7 @@ The settings window uses the WebView2 runtime already supplied by modern Windows
 
 ## How it works
 
-The Rust backend observes the same physical keyboard shortcuts as your selected dictation app using `WH_KEYBOARD_LL`, mirrors its hold/double-tap/hands-free gestures, and writes Discord voice settings through Discord desktop's local named pipe. It does not read speech or typed text.
+The Rust backend observes the same physical keyboard shortcuts as your selected dictation app using `WH_KEYBOARD_LL`, mirrors its hold/double-tap/hands-free gestures, and writes Discord voice settings through Discord desktop's local named pipe. Injected keystrokes (including software macros and dictation paste shortcuts) are ignored. It does not read speech or typed text.
 
 The tray process starts without a webview. Tauri creates the settings webview only when requested and destroys it when closed, keeping normal background usage small.
 

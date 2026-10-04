@@ -198,7 +198,9 @@ pub fn run() {
                 discord_tx: discord_tx.clone(),
                 status,
             });
-            set_autostart(&handle, store.get().launch_at_login);
+            if !std::env::args().any(|arg| arg == "--diagnostic") {
+                set_autostart(&handle, store.get().launch_at_login);
+            }
             if !store.get().discord_rpc.client_id.is_empty() {
                 let _ = discord_tx.send(DiscordCommand::Connect);
             }

@@ -117,6 +117,13 @@ pub fn start_gesture_worker(
                     if !gesture.active && !disconnected && config.unmute_delay_ms > 0 {
                         thread::sleep(Duration::from_millis(config.unmute_delay_ms));
                     }
+                    #[cfg(debug_assertions)]
+                    eprintln!(
+                        "{} gesture active={} latched={}",
+                        crate::discord::now_ms(),
+                        gesture.active,
+                        gesture.latched
+                    );
                     let _ = discord.send(DiscordCommand::SetMute(gesture.active));
                 }
                 if disconnected {

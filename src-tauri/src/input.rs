@@ -15,9 +15,9 @@ use windows::Win32::{
             VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SHIFT,
         },
         WindowsAndMessaging::{
-            CallNextHookEx, DispatchMessageW, GetMessageW, HC_ACTION, KBDLLHOOKSTRUCT, MSG,
-            SetWindowsHookExW, TranslateMessage, WH_KEYBOARD_LL, WM_KEYDOWN, WM_KEYUP,
-            WM_SYSKEYDOWN, WM_SYSKEYUP,
+            CallNextHookEx, DispatchMessageW, GetMessageW, HC_ACTION, KBDLLHOOKSTRUCT,
+            LLKHF_INJECTED, MSG, SetWindowsHookExW, TranslateMessage, WH_KEYBOARD_LL, WM_KEYDOWN,
+            WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
         },
     },
 };
@@ -110,7 +110,7 @@ impl InputMonitor {
             keys.hands_free_active = false;
             keys.mods.clear();
             keys.pressed_keys.clear();
-            let _ = self.shared.event_tx.send(InputEvent::Dismiss);
+            send_event(&self.shared.event_tx, InputEvent::Dismiss);
         }
     }
 
@@ -153,14 +153,31 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
             let down = wparam.0 == WM_KEYDOWN as usize || wparam.0 == WM_SYSKEYDOWN as usize;
             let up = wparam.0 == WM_KEYUP as usize || wparam.0 == WM_SYSKEYUP as usize;
             if down || up {
-                handle_key(shared, event.vkCode, down);
+                handle_key(
+                    shared,
+                    event.vkCode,
+                    down,
+                    event.flags.contains(LLKHF_INJECTED),
+                );
             }
         }
     }
     unsafe { CallNextHookEx(None, code, wparam, lparam) }
 }
 
-fn handle_key(shared: &Shared, vk: u32, down: bool) {
+fn handle_key(shared: &Shared, vk: u32, down: bool, injected: bool) {
+    // Dictation apps paste with synthetic modifiers, sometimes before the user
+    // releases the other shortcut key. Those events must not alter physical state.
+    if injected {
+        #[cfg(debug_assertions)]
+        if let Some(modifier) = modifier_for(vk) {
+            eprintln!(
+                "{} ignored injected modifier {modifier:?} down={down}",
+                crate::discord::now_ms()
+            );
+        }
+        return;
+    }
     let modifier = modifier_for(vk);
     let capturing = shared
         .capture
@@ -212,7 +229,7 @@ fn handle_key(shared: &Shared, vk: u32, down: bool) {
 
     let config = shared.config.get();
     if config.dictation_app == DictationApp::Wispr && down && vk == VK_ESCAPE.0 as u32 {
-        let _ = shared.event_tx.send(InputEvent::Dismiss);
+        send_event(&shared.event_tx, InputEvent::Dismiss);
         return;
     }
     evaluate_shortcuts(&mut keys, &config, &shared.event_tx);
@@ -222,10 +239,10 @@ fn evaluate_shortcuts(keys: &mut Keys, config: &Config, event_tx: &mpsc::Sender<
     let required_down = shortcut_down(&config.shortcut, keys);
     if required_down && exact_mods(&keys.mods, &config.shortcut.mods) && !keys.active {
         keys.active = true;
-        let _ = event_tx.send(InputEvent::Press);
+        send_event(event_tx, InputEvent::Press);
     } else if keys.active && !required_down {
         keys.active = false;
-        let _ = event_tx.send(InputEvent::Release);
+        send_event(event_tx, InputEvent::Release);
     }
     if config.dictation_app == DictationApp::Wispr {
         let required_down = shortcut_down(&config.hands_free_shortcut, keys);
@@ -234,11 +251,17 @@ fn evaluate_shortcuts(keys: &mut Keys, config: &Config, event_tx: &mpsc::Sender<
             && !keys.hands_free_active
         {
             keys.hands_free_active = true;
-            let _ = event_tx.send(InputEvent::HandsFreePress);
+            send_event(event_tx, InputEvent::HandsFreePress);
         } else if keys.hands_free_active && !required_down {
             keys.hands_free_active = false;
         }
     }
+}
+
+fn send_event(tx: &mpsc::Sender<InputEvent>, event: InputEvent) {
+    #[cfg(debug_assertions)]
+    eprintln!("{} input {event:?}", crate::discord::now_ms());
+    let _ = tx.send(event);
 }
 
 fn shortcut_down(shortcut: &Shortcut, keys: &Keys) -> bool {
@@ -315,6 +338,89 @@ fn from_mod_key(value: ModKey) -> Mod {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn keyboard_test_shared() -> (Shared, mpsc::Receiver<InputEvent>) {
+        let (event_tx, rx) = mpsc::channel();
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("bridge-input-{unique}.json"));
+        (
+            Shared {
+                config: Arc::new(ConfigStore::load(path)),
+                event_tx,
+                keys: Mutex::new(Keys::default()),
+                capture: Mutex::new(None),
+            },
+            rx,
+        )
+    }
+
+    #[test]
+    fn injected_paste_modifier_cannot_restart_after_physical_release() {
+        let (shared, rx) = keyboard_test_shared();
+        handle_key(&shared, VK_LCONTROL.0 as u32, true, false);
+        handle_key(&shared, VK_LWIN.0 as u32, true, false);
+        assert_eq!(rx.try_recv().unwrap(), InputEvent::Press);
+        // Release Ctrl first, leaving Win physically held while dictation pastes.
+        handle_key(&shared, VK_LCONTROL.0 as u32, false, false);
+        assert_eq!(rx.try_recv().unwrap(), InputEvent::Release);
+        handle_key(&shared, VK_LCONTROL.0 as u32, true, true);
+        handle_key(&shared, VK_LCONTROL.0 as u32, false, true);
+        handle_key(&shared, VK_LWIN.0 as u32, false, false);
+        assert!(
+            rx.try_recv().is_err(),
+            "paste must not start another mute cycle"
+        );
+        assert!(shared.keys.lock().unwrap().mods.is_empty());
+    }
+
+    #[test]
+    fn injected_modifier_release_cannot_end_a_physical_hold() {
+        let (shared, rx) = keyboard_test_shared();
+        handle_key(&shared, VK_LCONTROL.0 as u32, true, false);
+        handle_key(&shared, VK_LWIN.0 as u32, true, false);
+        assert_eq!(rx.try_recv().unwrap(), InputEvent::Press);
+        handle_key(&shared, VK_LCONTROL.0 as u32, false, true);
+        handle_key(&shared, VK_LCONTROL.0 as u32, true, true);
+        assert!(
+            rx.try_recv().is_err(),
+            "injected keys must not change a physical hold"
+        );
+        handle_key(&shared, VK_LWIN.0 as u32, false, false);
+        assert_eq!(rx.try_recv().unwrap(), InputEvent::Release);
+        handle_key(&shared, VK_LCONTROL.0 as u32, false, false);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn injected_shortcut_cannot_start_dictation() {
+        let (shared, rx) = keyboard_test_shared();
+        for (vk, down) in [
+            (VK_LCONTROL.0, true),
+            (VK_LWIN.0, true),
+            (VK_LCONTROL.0, false),
+            (VK_LWIN.0, false),
+        ] {
+            handle_key(&shared, vk as u32, down, true);
+        }
+        assert!(rx.try_recv().is_err());
+        assert!(shared.keys.lock().unwrap().mods.is_empty());
+    }
+
+    #[test]
+    fn injected_keys_cannot_complete_shortcut_capture() {
+        let (shared, _) = keyboard_test_shared();
+        let (tx, rx) = mpsc::channel();
+        *shared.capture.lock().unwrap() = Some(tx);
+        handle_key(&shared, VK_LCONTROL.0 as u32, true, true);
+        handle_key(&shared, VK_LCONTROL.0 as u32, false, true);
+        assert!(rx.try_recv().is_err());
+        handle_key(&shared, VK_LCONTROL.0 as u32, true, false);
+        handle_key(&shared, VK_LCONTROL.0 as u32, false, false);
+        assert_eq!(rx.try_recv().unwrap().mods, vec![Mod::Ctrl]);
+    }
 
     #[test]
     fn wispr_hands_free_emits_once_per_press_and_primary_releases() {

@@ -141,6 +141,8 @@ pub fn start_worker(
                         }
                     }
                     DiscordCommand::SetMute(on) => {
+                        #[cfg(debug_assertions)]
+                        eprintln!("{} worker mute={on} desired_active={:?} owns={owns_mute} prior={prior:?}", now_ms(), status.lock().ok().map(|s| s.active));
                         let Some(rpc) = client.as_mut() else { continue };
                         let result = if on {
                             (|| {
@@ -368,7 +370,8 @@ fn preserve_manual_voice(
         let preserved = preserved_voice(before, last, current);
         #[cfg(debug_assertions)]
         eprintln!(
-            "voice preserve prior={before:?} applied={last:?} current={current:?} restore={preserved:?}"
+            "{} voice preserve prior={before:?} applied={last:?} current={current:?} restore={preserved:?}",
+            now_ms()
         );
         *prior = Some(preserved);
     }
@@ -439,6 +442,15 @@ impl RpcClient<File> {
 
 impl<T: Read + Write> RpcClient<T> {
     fn send_request(&mut self, command: &str, args: Value) -> Result<String, String> {
+        #[cfg(debug_assertions)]
+        if command == "SET_VOICE_SETTINGS" {
+            eprintln!(
+                "{} rpc set mute={} deaf={}",
+                now_ms(),
+                args["mute"],
+                args["deaf"]
+            );
+        }
         self.nonce += 1;
         let nonce = self.nonce.to_string();
         self.write_frame(1, &json!({ "cmd": command, "args": args, "nonce": nonce }))?;
@@ -518,8 +530,10 @@ impl<T: Read + Write> RpcClient<T> {
                 let state = own_channel_voice_state(&channel, &user_id)?;
                 #[cfg(debug_assertions)]
                 eprintln!(
-                    "voice snapshot source=channel mute={} deaf={}",
-                    state.mute, state.deaf
+                    "{} voice snapshot source=channel mute={} deaf={}",
+                    now_ms(),
+                    state.mute,
+                    state.deaf
                 );
                 return Ok(state);
             }
@@ -808,7 +822,7 @@ fn rpc_error_message(payload: &Value) -> String {
     message.into()
 }
 
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or(Duration::ZERO)
