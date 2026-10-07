@@ -162,7 +162,11 @@ pub fn start(path: PathBuf, discord: mpsc::Sender<DiscordCommand>) {
                             last_press = Some((message, Instant::now()));
                             let (reply, result) = mpsc::sync_channel(1);
                             if discord
-                                .send(DiscordCommand::PlaySound(pad.sound_id.clone(), reply))
+                                .send(DiscordCommand::PlaySound(
+                                    pad.sound_id.clone(),
+                                    Instant::now(),
+                                    reply,
+                                ))
                                 .is_err()
                             {
                                 break;

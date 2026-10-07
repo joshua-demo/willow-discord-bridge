@@ -18,7 +18,7 @@ type Config = {
 type Status = {
   active: boolean;
   engineReady: boolean;
-  rpc: 'disconnected' | 'connecting' | 'connected';
+  rpc: 'disconnected' | 'connecting' | 'reconnecting' | 'connected';
   rpcError: string | null;
 };
 type SaveResult = { ok: true; config: Config } | { ok: false; error: string };
@@ -138,15 +138,15 @@ function renderStatus(status: Status): void {
     elements.statusLabel.textContent = 'Listener unavailable';
     elements.statusDot.className = 'dot warn';
   } else if (status.active) {
-    elements.statusLabel.textContent = 'Dictating';
-    elements.statusDot.className = 'dot active';
+    elements.statusLabel.textContent = status.rpc === 'connected' ? 'Dictating' : 'Dictating · disconnected';
+    elements.statusDot.className = status.rpc === 'connected' ? 'dot active' : 'dot warn';
   } else {
     elements.statusLabel.textContent = 'Ready';
     elements.statusDot.className = 'dot idle';
   }
-  const labels = { connected: 'Connected', connecting: 'Connecting…', disconnected: 'Not connected' };
+  const labels = { connected: 'Connected', connecting: 'Connecting…', reconnecting: 'Reconnecting…', disconnected: 'Not connected' };
   elements.rpcState.textContent = labels[status.rpc];
-  elements.rpcState.className = `pill ${status.rpc === 'connected' ? 'pill-on' : status.rpc === 'connecting' ? 'pill-warn' : 'pill-off'}`;
+  elements.rpcState.className = `pill ${status.rpc === 'connected' ? 'pill-on' : status.rpc === 'connecting' || status.rpc === 'reconnecting' ? 'pill-warn' : 'pill-off'}`;
   elements.rpcError.textContent = status.rpcError || '';
   elements.rpcError.hidden = !status.rpcError;
 }

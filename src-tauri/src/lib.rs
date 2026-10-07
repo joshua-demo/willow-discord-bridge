@@ -3,6 +3,8 @@ mod discord;
 mod gesture;
 mod input;
 mod midi;
+mod pipe;
+mod recovery;
 
 use config::{Config, ConfigStore};
 use discord::{BridgeStatus, DiscordCommand};
@@ -13,11 +15,12 @@ use std::{
     sync::{Arc, Mutex, mpsc},
 };
 use tauri::{
-    AppHandle, Manager, State, WebviewUrl, WebviewWindowBuilder,
+    AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder,
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
 };
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
+use tauri_plugin_notification::NotificationExt;
 use windows::{
     Win32::UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL},
     core::{HSTRING, PCWSTR},
@@ -157,6 +160,25 @@ fn config_path(app: &AppHandle) -> PathBuf {
         .join("config.json")
 }
 
+fn tray_tooltip(status: &BridgeStatus) -> String {
+    let label = match status.rpc {
+        discord::RpcState::Connected => "Connected",
+        discord::RpcState::Connecting => "Connecting",
+        discord::RpcState::Reconnecting => "Reconnecting",
+        discord::RpcState::Disconnected => "Not connected",
+    };
+    let attention = if status.rpc_error.is_some()
+        && matches!(
+            status.rpc,
+            discord::RpcState::Connected | discord::RpcState::Disconnected
+        ) {
+        " — check settings"
+    } else {
+        ""
+    };
+    format!("Willow Discord Bridge — {label}{attention}")
+}
+
 fn should_prevent_exit(code: Option<i32>) -> bool {
     code.is_none()
 }
@@ -167,6 +189,7 @@ pub fn run() {
         .plugin(tauri_plugin_single_instance::init(|app, _, _| {
             let _ = show_settings(app);
         }))
+        .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_autostart::init(
             MacosLauncher::LaunchAgent,
             Some(vec!["--hidden"]),
@@ -175,7 +198,22 @@ pub fn run() {
             let handle = app.handle().clone();
             let store = Arc::new(ConfigStore::load(config_path(&handle)));
             let status = Arc::new(Mutex::new(BridgeStatus::default()));
-            let discord_tx = discord::start_worker(store.clone(), status.clone());
+            let events = handle.clone();
+            let discord_tx =
+                discord::start_worker(store.clone(), status.clone(), move |current, notice| {
+                    if let Some(tray) = events.tray_by_id("main") {
+                        let _ = tray.set_tooltip(Some(tray_tooltip(&current)));
+                    }
+                    let _ = events.emit("bridge-status", &current);
+                    if let Some(notice) = notice {
+                        let _ = events
+                            .notification()
+                            .builder()
+                            .title("Willow Discord Bridge")
+                            .body(notice.body())
+                            .show();
+                    }
+                });
             midi::start(
                 config_path(&handle).with_file_name("midi-pads.json"),
                 discord_tx.clone(),
@@ -201,10 +239,6 @@ pub fn run() {
             if !std::env::args().any(|arg| arg == "--diagnostic") {
                 set_autostart(&handle, store.get().launch_at_login);
             }
-            if !store.get().discord_rpc.client_id.is_empty() {
-                let _ = discord_tx.send(DiscordCommand::Connect);
-            }
-
             let settings = MenuItem::with_id(app, "settings", "Settings…", true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&settings, &quit])?;
@@ -238,6 +272,16 @@ pub fn run() {
                     }
                 })
                 .build(app)?;
+            // Startup authorization errors can arrive before the tray exists.
+            let tooltip = app
+                .state::<AppState>()
+                .status
+                .lock()
+                .ok()
+                .map(|current| tray_tooltip(&current));
+            if let Some(tooltip) = tooltip {
+                let _ = tray.set_tooltip(Some(tooltip));
+            }
             std::mem::forget(tray);
 
             if !std::env::args().any(|arg| arg == "--hidden") {
@@ -270,7 +314,28 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::should_prevent_exit;
+    use super::{BridgeStatus, discord::RpcState, should_prevent_exit, tray_tooltip};
+
+    #[test]
+    fn tray_reports_persistent_errors_without_treating_retries_as_manual_failures() {
+        for rpc in [RpcState::Connected, RpcState::Disconnected] {
+            let status = BridgeStatus {
+                rpc,
+                rpc_error: Some("needs attention".into()),
+                ..Default::default()
+            };
+            assert!(tray_tooltip(&status).contains("check settings"));
+        }
+        let status = BridgeStatus {
+            rpc: RpcState::Reconnecting,
+            rpc_error: Some("pipe closed".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            tray_tooltip(&status),
+            "Willow Discord Bridge — Reconnecting"
+        );
+    }
 
     #[test]
     fn closing_the_last_window_keeps_the_tray_process_alive() {

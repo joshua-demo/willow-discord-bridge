@@ -22,6 +22,7 @@ A tiny Tauri notification-area app that self-mutes—and optionally self-deafens
 - Mute/deafen and prior-state restoration work in all servers. Outside the allowlist (or in DMs/no call), playback is skipped and there is no Soundboard deafen delay. If the guild lookup fails, sounds are skipped without blocking mute/deafen.
 - Read your own voice-channel self-mute/deafen flags before dictation. Starting mute/deafen flags are never automatically cleared. A manual deafen during mute-only dictation is kept when dictation stops.
 - Configurable shortcut, gesture mode, deafen behavior, unmute delay, and start-with-Windows.
+- Automatically reconnect after pipe failures, with quiet token refresh and Windows notifications when recovery needs attention.
 - Encrypt Discord credentials and OAuth tokens with Windows DPAPI.
 - Direct Discord local RPC—no simulated Discord keypresses or internet-facing server.
 
@@ -44,6 +45,14 @@ The settings window uses the WebView2 runtime already supplied by modern Windows
 The Rust backend observes the same physical keyboard shortcuts as your selected dictation app using `WH_KEYBOARD_LL`, mirrors its hold/double-tap/hands-free gestures, and writes Discord voice settings through Discord desktop's local named pipe. Injected keystrokes (including software macros and dictation paste shortcuts) are ignored. It does not read speech or typed text.
 
 The tray process starts without a webview. Tauri creates the settings webview only when requested and destroys it when closed, keeping normal background usage small.
+
+## Connection recovery
+
+The tray worker checks for idle pipe closure and answers Discord pings, with a read-only heartbeat every 15 seconds. Stalled IPC requests time out after three seconds. Reconnects back off from one second to a maximum of 30 seconds; they never replay sounds or open authorization dialogs.
+
+If dictation is interrupted, its original voice-state snapshot is retained for restoration after reconnecting to the same Discord account and application. A release while offline is still honored. Unknown starting state or a changed account/application never causes a guessed unmute.
+
+Windows warnings appear when dictation loses its connection, an outage lasts a minute, or authorization/state restoration needs attention. Warnings are deduplicated; an outage warning can escalate once if manual action becomes necessary. The connection badge and tray tooltip remain available if Windows suppresses notifications. If authorization expires and cannot be refreshed, background attempts pause until you click **Connect**.
 
 ## Requirements
 
@@ -97,7 +106,7 @@ to disable MIDI input. Configuration changes take effect after restarting.
 3. Under **OAuth2**, copy the **Client ID** and generate/copy a **Client Secret**.
 4. Add the redirect URI exactly: `http://localhost`
 5. Open Willow Discord Bridge settings and paste both values.
-6. Select **Save and connect**, then approve Discord's prompt.
+6. Select **Connect**, then approve Discord's prompt.
 
 ## Develop
 
@@ -134,8 +143,8 @@ Use `npm version patch`, `npm version minor`, or `npm version major`, then push 
 
 - Synchronization is based on shared keyboard shortcuts, not actual recording-state events. Stops initiated through app UI or automatic cancellation can leave the bridge active; use the stop shortcut (or Escape with the Wispr profile) to restore Discord.
 - Discord RPC requires Discord desktop and developer-application authorization. Soundboard playback uses Discord's undocumented local `GET_SOUNDBOARD_SOUNDS` and `PLAY_SOUNDBOARD_SOUND` RPC commands; the bridge looks up the sound's source server automatically and caches it for the connection to avoid repeating that lookup during dictation. Playing it in another server may require **Use External Sounds** permission. Errors appear in the settings connection panel without preventing self-mute. Mute and playback requests are pipelined, not atomic; there can be a brief open-mic window before Discord applies mute. A sound will not play if you were already deafened or if another sound was attempted in the last five seconds.
-- If Discord's prior or current state cannot be read, the bridge does not guess an unmute. Manual changes are detected by comparing the current state with the last state the bridge applied; a click that leaves the effective state unchanged cannot be distinguished from the bridge's own mute/deafen.
-- A hard process kill cannot perform graceful cleanup, although Discord normally reverts RPC-controlled voice settings when its controller disconnects.
+- If Discord's prior or current state cannot be read, the bridge does not guess an unmute. Manual changes are detected by comparing the current state with the last state the bridge applied; a click that leaves the effective state unchanged, or changes that happen entirely between reads during an outage, cannot always be distinguished from the bridge's own mute/deafen.
+- Automatic mute/deafen cannot be guaranteed while Discord is disconnected. Recovery retains an interrupted session's snapshot only while the bridge process stays running; a hard process kill cannot perform graceful cleanup. Discord normally reverts RPC-controlled voice settings when its controller disconnects.
 
 ## Attribution and license
 

@@ -1,20 +1,22 @@
-use crate::config::{ConfigStore, DiscordRpc};
+use crate::{
+    config::{ConfigStore, DiscordRpc},
+    pipe::{DiscordPipe, RPC_TIMEOUT, RpcTransport},
+    recovery::{Connection, Notice},
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
-    fs::{File, OpenOptions},
-    io::{Read, Write},
     sync::{Arc, Mutex, mpsc},
-    thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RpcState {
     Disconnected,
     Connecting,
+    Reconnecting,
     Connected,
 }
 
@@ -40,7 +42,7 @@ impl Default for BridgeStatus {
 
 pub enum DiscordCommand {
     Connect,
-    PlaySound(String, mpsc::SyncSender<Result<bool, String>>),
+    PlaySound(String, Instant, mpsc::SyncSender<Result<bool, String>>),
     SetMute(bool),
     RefreshActive,
     Shutdown,
@@ -48,211 +50,15 @@ pub enum DiscordCommand {
 
 const SOUNDBOARD_START_GRACE: Duration = Duration::from_millis(100);
 
-pub fn start_worker(
+pub(crate) fn start_worker(
     store: Arc<ConfigStore>,
     status: Arc<Mutex<BridgeStatus>>,
+    on_status: impl Fn(BridgeStatus, Option<Notice>) + Send + 'static,
 ) -> mpsc::Sender<DiscordCommand> {
-    let (tx, rx) = mpsc::channel();
-    thread::Builder::new()
-        .name("discord-rpc".into())
-        .spawn(move || {
-            let mut client: Option<RpcClient> = None;
-            let mut prior: Option<VoiceState> = None;
-            let mut applied: Option<VoiceState> = None;
-            let mut owns_mute = false;
-            let mut last_sound_attempt: Option<Instant> = None;
-            let mut pending_deafen: Option<Instant> = None;
-            loop {
-                let received = match pending_deafen {
-                    Some(deadline) => {
-                        rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))
-                    }
-                    None => rx.recv().map_err(|_| mpsc::RecvTimeoutError::Disconnected),
-                };
-                let command = match received {
-                    Ok(command) => command,
-                    Err(mpsc::RecvTimeoutError::Timeout) => {
-                        pending_deafen = None;
-                        if owns_mute && store.get().deafen_while_active {
-                            if let Some(rpc) = client.as_mut() {
-                                let result = preserve_manual_voice(rpc, &mut prior, applied)
-                                    .and_then(|_| set_active_voice(rpc, prior, true));
-                                if let Err(error) = result {
-                                    client = None;
-                                    prior = None;
-                                    applied = None;
-                                    owns_mute = false;
-                                    set_rpc_status(&status, RpcState::Disconnected, Some(error));
-                                } else {
-                                    applied = active_voice_state(prior, true);
-                                }
-                            }
-                        }
-                        continue;
-                    }
-                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                };
-                match command {
-                    DiscordCommand::PlaySound(sound_id, reply) => {
-                        let result = (|| {
-                            if client.is_none() {
-                                client = Some(connect_authenticated(&store)?);
-                            }
-                            play_allowed_sound(
-                                client.as_mut().expect("connected"),
-                                &sound_id,
-                                &store.get().soundboard_guild_ids,
-                            )
-                        })();
-                        // Playback never changes mute/deafen state or retries a sound: a
-                        // lost reply could otherwise cause duplicate playback.
-                        // Reconnect on the next press after an error, unless this
-                        // connection still owns a dictation mute that must be restored.
-                        if result.is_err() && !owns_mute {
-                            client = None;
-                        }
-                        set_rpc_status(
-                            &status,
-                            if client.is_some() {
-                                RpcState::Connected
-                            } else {
-                                RpcState::Disconnected
-                            },
-                            result.as_ref().err().cloned(),
-                        );
-                        let _ = reply.try_send(result);
-                    }
-                    DiscordCommand::Connect => {
-                        set_rpc_status(&status, RpcState::Connecting, None);
-                        match connect_authenticated(&store) {
-                            Ok(next) => {
-                                client = Some(next);
-                                prior = None;
-                                applied = None;
-                                owns_mute = false;
-                                pending_deafen = None;
-                                set_rpc_status(&status, RpcState::Connected, None);
-                            }
-                            Err(error) => {
-                                client = None;
-                                pending_deafen = None;
-                                set_rpc_status(&status, RpcState::Disconnected, Some(error));
-                            }
-                        }
-                    }
-                    DiscordCommand::SetMute(on) => {
-                        #[cfg(debug_assertions)]
-                        eprintln!("{} worker mute={on} desired_active={:?} owns={owns_mute} prior={prior:?}", now_ms(), status.lock().ok().map(|s| s.active));
-                        let Some(rpc) = client.as_mut() else { continue };
-                        let result = if on {
-                            (|| {
-                                let first_activation = !owns_mute;
-                                if first_activation {
-                                    prior = rpc.get_voice_settings().ok();
-                                    applied = prior;
-                                    owns_mute = true;
-                                } else {
-                                    preserve_manual_voice(rpc, &mut prior, applied)?;
-                                }
-                                let config = store.get();
-                                let can_play = first_activation
-                                    && prior.is_some_and(|state| !state.deaf)
-                                    && !config.soundboard_sound_id.is_empty()
-                                    && last_sound_attempt.is_none_or(|last| {
-                                        last.elapsed() >= Duration::from_secs(5)
-                                    });
-                                let result = if can_play {
-                                    begin_announcement(
-                                        rpc,
-                                        prior,
-                                        &config.soundboard_sound_id,
-                                        config.deafen_while_active,
-                                        &config.soundboard_guild_ids,
-                                    )
-                                    .map(|announcement| {
-                                        if announcement.sound_attempted {
-                                            last_sound_attempt = Some(Instant::now());
-                                        }
-                                        pending_deafen = announcement.deafen_at;
-                                        set_rpc_status(
-                                            &status,
-                                            RpcState::Connected,
-                                            announcement
-                                                .sound_error
-                                                .map(|error| format!("Soundboard: {error}")),
-                                        );
-                                    })
-                                } else {
-                                    set_active_voice(
-                                        rpc,
-                                        prior,
-                                        config.deafen_while_active && pending_deafen.is_none(),
-                                    )
-                                };
-                                if result.is_ok() {
-                                    applied = active_voice_state(
-                                        prior,
-                                        config.deafen_while_active && pending_deafen.is_none(),
-                                    );
-                                }
-                                result
-                            })()
-                        } else {
-                            if !owns_mute {
-                                continue;
-                            }
-                            owns_mute = false;
-                            pending_deafen = None;
-                            restore_voice(rpc, prior.take(), applied.take())
-                        };
-                        if let Err(error) = result {
-                            client = None;
-                            prior = None;
-                            applied = None;
-                            owns_mute = false;
-                            pending_deafen = None;
-                            set_rpc_status(&status, RpcState::Disconnected, Some(error));
-                        }
-                    }
-                    DiscordCommand::RefreshActive => {
-                        if !owns_mute {
-                            continue;
-                        }
-                        let Some(rpc) = client.as_mut() else { continue };
-                        let config = store.get();
-                        if !config.deafen_while_active || config.soundboard_sound_id.is_empty() {
-                            pending_deafen = None;
-                        }
-                        let deafen = config.deafen_while_active && pending_deafen.is_none();
-                        let result = preserve_manual_voice(rpc, &mut prior, applied)
-                            .and_then(|_| set_active_voice(rpc, prior, deafen));
-                        if let Err(error) = result {
-                            client = None;
-                            prior = None;
-                            applied = None;
-                            owns_mute = false;
-                            pending_deafen = None;
-                            set_rpc_status(&status, RpcState::Disconnected, Some(error));
-                        } else {
-                            applied = active_voice_state(prior, deafen);
-                        }
-                    }
-                    DiscordCommand::Shutdown => {
-                        if owns_mute {
-                            if let Some(rpc) = client.as_mut() {
-                                let _ = restore_voice(rpc, prior.take(), applied.take());
-                            }
-                        }
-                        break;
-                    }
-                }
-            }
-        })
-        .expect("failed to start Discord worker");
-    tx
+    crate::recovery::start_worker(store, status, on_status)
 }
 
-trait VoiceControl {
+pub(crate) trait VoiceControl {
     fn get_voice_settings(&mut self) -> Result<VoiceState, String>;
     fn soundboard_allowed(&mut self, guild_ids: &[String]) -> Result<bool, String>;
     fn set_voice_settings(&mut self, mute: bool, deaf: Option<bool>) -> Result<(), String>;
@@ -269,7 +75,7 @@ trait VoiceControl {
 }
 
 // Used by standalone/MIDI playback as well as the dictation announcement gate.
-fn play_allowed_sound(
+pub(crate) fn play_allowed_sound(
     rpc: &mut impl VoiceControl,
     sound_id: &str,
     guild_ids: &[String],
@@ -281,13 +87,13 @@ fn play_allowed_sound(
     Ok(true)
 }
 
-struct Announcement {
-    sound_error: Option<String>,
-    sound_attempted: bool,
-    deafen_at: Option<Instant>,
+pub(crate) struct Announcement {
+    pub(crate) sound_error: Option<String>,
+    pub(crate) sound_attempted: bool,
+    pub(crate) deafen_at: Option<Instant>,
 }
 
-fn begin_announcement(
+pub(crate) fn begin_announcement(
     rpc: &mut impl VoiceControl,
     prior: Option<VoiceState>,
     sound_id: &str,
@@ -325,7 +131,7 @@ fn begin_announcement(
     })
 }
 
-fn set_active_voice(
+pub(crate) fn set_active_voice(
     rpc: &mut impl VoiceControl,
     prior: Option<VoiceState>,
     deafen_while_active: bool,
@@ -338,6 +144,7 @@ fn set_active_voice(
     rpc.set_voice_settings(true, deaf)
 }
 
+#[cfg(test)]
 fn active_voice_state(prior: Option<VoiceState>, deafen: bool) -> Option<VoiceState> {
     prior.map(|state| VoiceState {
         mute: true,
@@ -360,7 +167,7 @@ fn preserved_voice(prior: VoiceState, applied: VoiceState, current: VoiceState) 
     }
 }
 
-fn preserve_manual_voice(
+pub(crate) fn preserve_manual_voice(
     rpc: &mut impl VoiceControl,
     prior: &mut Option<VoiceState>,
     applied: Option<VoiceState>,
@@ -378,7 +185,7 @@ fn preserve_manual_voice(
     Ok(())
 }
 
-fn restore_voice(
+pub(crate) fn restore_voice(
     rpc: &mut impl VoiceControl,
     mut prior: Option<VoiceState>,
     applied: Option<VoiceState>,
@@ -390,41 +197,28 @@ fn restore_voice(
     Ok(()) // Unknown initial state: never guess that unmuting is safe.
 }
 
-fn set_rpc_status(status: &Mutex<BridgeStatus>, rpc: RpcState, error: Option<String>) {
-    if let Ok(mut status) = status.lock() {
-        status.rpc = rpc;
-        status.rpc_error = error;
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct VoiceState {
-    mute: bool,
-    deaf: bool,
+pub(crate) struct VoiceState {
+    pub(crate) mute: bool,
+    pub(crate) deaf: bool,
 }
 
-struct RpcClient<T = File> {
+pub(crate) struct RpcClient<T = DiscordPipe> {
     pipe: T,
     nonce: u64,
     soundboard_args: HashMap<String, Value>,
     user_id: Option<String>,
+    broken: bool,
 }
 
-impl RpcClient<File> {
+impl RpcClient<DiscordPipe> {
     fn connect(client_id: &str) -> Result<Self, String> {
-        let mut pipe = None;
-        for index in 0..10 {
-            let path = format!(r"\\?\pipe\discord-ipc-{index}");
-            if let Ok(file) = OpenOptions::new().read(true).write(true).open(path) {
-                pipe = Some(file);
-                break;
-            }
-        }
         let mut client = Self {
-            pipe: pipe.ok_or("Discord desktop RPC pipe was not found")?,
+            pipe: DiscordPipe::open().map_err(|error| error.to_string())?,
             nonce: 0,
             soundboard_args: HashMap::new(),
             user_id: None,
+            broken: false,
         };
         client.write_frame(0, &json!({ "v": 1, "client_id": client_id }))?;
         loop {
@@ -440,7 +234,7 @@ impl RpcClient<File> {
     }
 }
 
-impl<T: Read + Write> RpcClient<T> {
+impl<T: RpcTransport> RpcClient<T> {
     fn send_request(&mut self, command: &str, args: Value) -> Result<String, String> {
         #[cfg(debug_assertions)]
         if command == "SET_VOICE_SETTINGS" {
@@ -458,6 +252,12 @@ impl<T: Read + Write> RpcClient<T> {
     }
 
     fn request(&mut self, command: &str, args: Value) -> Result<Value, String> {
+        // Only an explicit Connect can issue AUTHORIZE and wait for its dialog.
+        self.pipe.begin_exchange(if command == "AUTHORIZE" {
+            Duration::from_secs(120)
+        } else {
+            RPC_TIMEOUT
+        });
         let nonce = self.send_request(command, args)?;
         self.wait_for_responses(&[nonce])?
             .pop()
@@ -471,12 +271,12 @@ impl<T: Read + Write> RpcClient<T> {
         let mut replies = vec![None; nonces.len()];
         while replies.iter().any(Option::is_none) {
             let (opcode, payload) = self.read_frame()?;
-            if opcode == 3 {
-                self.write_frame(4, &payload)?;
-                continue;
-            }
             if opcode == 2 {
+                self.broken = true;
                 return Err("Discord closed the RPC connection".into());
+            }
+            if opcode != 1 {
+                continue;
             }
             let Some(index) = nonces.iter().position(|nonce| {
                 payload.get("nonce").and_then(Value::as_str) == Some(nonce.as_str())
@@ -586,6 +386,7 @@ impl<T: Read + Write> RpcClient<T> {
                 return Ok(Some(error));
             }
         };
+        self.pipe.begin_exchange(RPC_TIMEOUT);
         let mut mute_args = json!({ "mute": true });
         if let Some(deaf) = deaf {
             mute_args["deaf"] = Value::Bool(deaf);
@@ -616,38 +417,75 @@ impl<T: Read + Write> RpcClient<T> {
 
     fn write_frame(&mut self, opcode: u32, payload: &Value) -> Result<(), String> {
         let body = serde_json::to_vec(payload).map_err(|error| error.to_string())?;
-        self.pipe
-            .write_all(&opcode.to_le_bytes())
-            .map_err(|error| error.to_string())?;
-        self.pipe
-            .write_all(&(body.len() as u32).to_le_bytes())
-            .map_err(|error| error.to_string())?;
-        self.pipe
-            .write_all(&body)
-            .map_err(|error| error.to_string())?;
-        self.pipe.flush().map_err(|error| error.to_string())
+        self.write_bytes(opcode, &body)
+    }
+
+    fn write_bytes(&mut self, opcode: u32, body: &[u8]) -> Result<(), String> {
+        let mut frame = Vec::with_capacity(8 + body.len());
+        frame.extend_from_slice(&opcode.to_le_bytes());
+        frame.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        frame.extend_from_slice(body);
+        let result = self
+            .pipe
+            .write_all(&frame)
+            .map_err(|error| error.to_string());
+        self.broken |= result.is_err();
+        result
     }
 
     fn read_frame(&mut self) -> Result<(u32, Value), String> {
-        let mut header = [0_u8; 8];
-        self.pipe
-            .read_exact(&mut header)
-            .map_err(|error| error.to_string())?;
-        let opcode = u32::from_le_bytes(header[0..4].try_into().expect("opcode"));
-        let length = u32::from_le_bytes(header[4..8].try_into().expect("length")) as usize;
-        if length > 16 * 1024 * 1024 {
-            return Err("Discord RPC frame was too large".into());
+        let result = (|| {
+            let mut header = [0_u8; 8];
+            self.pipe
+                .read_exact(&mut header)
+                .map_err(|error| error.to_string())?;
+            let opcode = u32::from_le_bytes(header[0..4].try_into().expect("opcode"));
+            let length = u32::from_le_bytes(header[4..8].try_into().expect("length")) as usize;
+            if length > 16 * 1024 * 1024 {
+                return Err("Discord RPC frame was too large".into());
+            }
+            let mut body = vec![0_u8; length];
+            self.pipe
+                .read_exact(&mut body)
+                .map_err(|error| error.to_string())?;
+            if opcode == 3 {
+                // Ping bodies are opaque. Echo the exact bytes even when empty
+                // or not JSON, both at idle and while awaiting RPC replies.
+                self.write_bytes(4, &body)?;
+                return Ok((opcode, Value::Null));
+            }
+            if opcode == 2 || opcode == 4 {
+                return Ok((opcode, Value::Null));
+            }
+            let payload = serde_json::from_slice(&body).map_err(|error| error.to_string())?;
+            Ok((opcode, payload))
+        })();
+        self.broken |= result.is_err();
+        result
+    }
+
+    fn poll_idle(&mut self) -> Result<(), String> {
+        self.pipe.begin_exchange(RPC_TIMEOUT);
+        // Bound each drain so an event stream cannot starve shortcut commands.
+        for _ in 0..32 {
+            let available = self.pipe.available().map_err(|error| {
+                self.broken = true;
+                error.to_string()
+            })?;
+            if available == 0 {
+                break;
+            }
+            let (opcode, _) = self.read_frame()?;
+            if opcode == 2 {
+                self.broken = true;
+                return Err("Discord closed the RPC connection".into());
+            }
         }
-        let mut body = vec![0_u8; length];
-        self.pipe
-            .read_exact(&mut body)
-            .map_err(|error| error.to_string())?;
-        let payload = serde_json::from_slice(&body).map_err(|error| error.to_string())?;
-        Ok((opcode, payload))
+        Ok(())
     }
 }
 
-impl<T: Read + Write> VoiceControl for RpcClient<T> {
+impl<T: RpcTransport> VoiceControl for RpcClient<T> {
     fn get_voice_settings(&mut self) -> Result<VoiceState, String> {
         RpcClient::get_voice_settings(self)
     }
@@ -673,6 +511,65 @@ impl<T: Read + Write> VoiceControl for RpcClient<T> {
     }
 }
 
+impl<T: RpcTransport + Send> Connection for RpcClient<T> {
+    fn account_id(&self) -> Option<&str> {
+        self.user_id.as_deref()
+    }
+    fn broken(&self) -> bool {
+        self.broken
+    }
+    fn poll_idle(&mut self) -> Result<(), String> {
+        RpcClient::poll_idle(self)
+    }
+    fn heartbeat(&mut self) -> Result<(), String> {
+        self.request("GET_VOICE_SETTINGS", json!({})).map(|_| ())
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct ConnectFailure {
+    pub(crate) message: String,
+    pub(crate) needs_action: bool,
+}
+
+impl ConnectFailure {
+    pub(crate) fn retry(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            needs_action: false,
+        }
+    }
+    pub(crate) fn action(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            needs_action: true,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TokenPlan {
+    Cached,
+    Refresh,
+    Authorize,
+    NeedsAuthorization,
+}
+
+fn token_plan(credentials: &DiscordRpc, interactive: bool, force_refresh: bool) -> TokenPlan {
+    if !force_refresh
+        && credentials.access_token.is_some()
+        && credentials.token_expires_at.unwrap_or(0) > now_ms() + 60_000
+    {
+        TokenPlan::Cached
+    } else if credentials.refresh_token.is_some() {
+        TokenPlan::Refresh
+    } else if interactive {
+        TokenPlan::Authorize
+    } else {
+        TokenPlan::NeedsAuthorization
+    }
+}
+
 #[derive(Deserialize)]
 struct TokenResponse {
     access_token: String,
@@ -680,62 +577,126 @@ struct TokenResponse {
     expires_in: u64,
 }
 
-fn connect_authenticated(store: &ConfigStore) -> Result<RpcClient, String> {
+pub(crate) fn connect_authenticated(
+    store: &ConfigStore,
+    interactive: bool,
+) -> Result<RpcClient, ConnectFailure> {
     let config = store.get();
     let credentials = config.discord_rpc;
     if credentials.client_id.is_empty() || credentials.client_secret.is_empty() {
-        return Err("Discord Client ID and Client Secret are required".into());
+        return Err(ConnectFailure::action(
+            "Discord Client ID and Client Secret are required",
+        ));
     }
-    let mut rpc = RpcClient::connect(&credentials.client_id)?;
-    let now = now_ms();
-    let token = if credentials.access_token.is_some()
-        && credentials.token_expires_at.unwrap_or(0) > now + 60_000
-    {
-        credentials.access_token.clone().expect("checked")
-    } else if let Some(refresh) = credentials.refresh_token.as_deref() {
-        match exchange_token(&credentials, None, Some(refresh)) {
-            Ok(tokens) => save_tokens(store, &tokens)?,
-            Err(_) => authorize_new(&mut rpc, store, &credentials)?,
+    // Check authorization before opening a pipe: background startup must never
+    // raise an OAuth dialog, even when Discord isn't running yet.
+    let plan = token_plan(&credentials, interactive, false);
+    if plan == TokenPlan::NeedsAuthorization {
+        return Err(ConnectFailure::action(
+            "Discord authorization is required. Click Connect to authorize.",
+        ));
+    }
+    let mut rpc = RpcClient::connect(&credentials.client_id).map_err(ConnectFailure::retry)?;
+    let token = obtain_token(&mut rpc, store, &credentials, interactive, plan)?;
+    if let Err(error) = rpc.authenticate(&token) {
+        if rpc.broken {
+            return Err(ConnectFailure::retry(error));
         }
-    } else {
-        authorize_new(&mut rpc, store, &credentials)?
-    };
-    rpc.authenticate(&token)?;
+        if plan != TokenPlan::Cached {
+            return Err(ConnectFailure::action(error));
+        }
+        // A cached token can be revoked before its recorded expiry. Refresh it
+        // once silently; only an explicit Connect may open authorization.
+        let token = obtain_token(
+            &mut rpc,
+            store,
+            &credentials,
+            interactive,
+            token_plan(&credentials, interactive, true),
+        )?;
+        rpc.authenticate(&token).map_err(|error| {
+            if rpc.broken {
+                ConnectFailure::retry(error)
+            } else {
+                ConnectFailure::action(error)
+            }
+        })?;
+    }
     if !config.soundboard_sound_id.is_empty() {
-        // Resolve the source guild while connecting, not while dictation starts.
-        // Failure here is nonfatal; playback will report it on the next attempt.
+        // Metadata lookup is nonfatal, but a transport failure is not a healthy
+        // connection. No sound is ever played while reconnecting.
         let _ = rpc.prepare_soundboard_sound(&config.soundboard_sound_id);
+        if rpc.broken {
+            return Err(ConnectFailure::retry(
+                "Discord pipe disconnected while preparing sound metadata",
+            ));
+        }
     }
     Ok(rpc)
+}
+
+fn obtain_token(
+    rpc: &mut RpcClient,
+    store: &ConfigStore,
+    credentials: &DiscordRpc,
+    interactive: bool,
+    plan: TokenPlan,
+) -> Result<String, ConnectFailure> {
+    match plan {
+        TokenPlan::Cached => Ok(credentials.access_token.clone().expect("cached token")),
+        TokenPlan::Refresh => {
+            match exchange_token(credentials, None, credentials.refresh_token.as_deref()) {
+                Ok(tokens) => save_tokens(store, &tokens),
+                Err(error) if error.needs_action && interactive => {
+                    authorize_new(rpc, store, credentials)
+                }
+                Err(error) => Err(error),
+            }
+        }
+        TokenPlan::Authorize => authorize_new(rpc, store, credentials),
+        TokenPlan::NeedsAuthorization => Err(ConnectFailure::action(
+            "Discord authorization has expired. Click Connect to authorize again.",
+        )),
+    }
 }
 
 fn authorize_new(
     rpc: &mut RpcClient,
     store: &ConfigStore,
     credentials: &DiscordRpc,
-) -> Result<String, String> {
-    let data = rpc.request(
-        "AUTHORIZE",
-        json!({
-            "scopes": ["rpc", "rpc.voice.write"],
-            "client_id": credentials.client_id,
-        }),
-    )?;
+) -> Result<String, ConnectFailure> {
+    let data = rpc
+        .request(
+            "AUTHORIZE",
+            json!({
+                "scopes": ["rpc", "rpc.voice.write"],
+                "client_id": credentials.client_id,
+            }),
+        )
+        .map_err(|error| {
+            if rpc.broken {
+                ConnectFailure::retry(error)
+            } else {
+                ConnectFailure::action(error)
+            }
+        })?;
     let code = data
         .get("code")
         .and_then(Value::as_str)
-        .ok_or("Discord did not return an authorization code")?;
+        .ok_or_else(|| ConnectFailure::action("Discord did not return an authorization code"))?;
     let tokens = exchange_token(credentials, Some(code), None)?;
     save_tokens(store, &tokens)
 }
 
-fn save_tokens(store: &ConfigStore, tokens: &TokenResponse) -> Result<String, String> {
+fn save_tokens(store: &ConfigStore, tokens: &TokenResponse) -> Result<String, ConnectFailure> {
     let expires_at = now_ms() + tokens.expires_in * 1000;
-    store.update_tokens(
-        tokens.access_token.clone(),
-        tokens.refresh_token.clone(),
-        expires_at,
-    )?;
+    store
+        .update_tokens(
+            tokens.access_token.clone(),
+            tokens.refresh_token.clone(),
+            expires_at,
+        )
+        .map_err(ConnectFailure::action)?;
     Ok(tokens.access_token.clone())
 }
 
@@ -743,7 +704,7 @@ fn exchange_token(
     credentials: &DiscordRpc,
     code: Option<&str>,
     refresh: Option<&str>,
-) -> Result<TokenResponse, String> {
+) -> Result<TokenResponse, ConnectFailure> {
     let mut form = vec![
         ("client_id", credentials.client_id.as_str()),
         ("client_secret", credentials.client_secret.as_str()),
@@ -757,15 +718,36 @@ fn exchange_token(
     } else if let Some(refresh) = refresh {
         form.extend([("grant_type", "refresh_token"), ("refresh_token", refresh)]);
     }
-    reqwest::blocking::Client::new()
+    let response = reqwest::blocking::Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(15))
+        .build()
+        .map_err(|error| ConnectFailure::retry(error.to_string()))?
         .post("https://discord.com/api/oauth2/token")
         .form(&form)
         .send()
-        .map_err(|error| error.to_string())?
-        .error_for_status()
-        .map_err(|error| error.to_string())?
+        .map_err(|error| ConnectFailure::retry(error.to_string()))?;
+    let status = response.status();
+    if !status.is_success() {
+        // Never include the token response body or submitted credentials in errors.
+        let message = format!(
+            "Discord token request failed (HTTP {}).{}",
+            status.as_u16(),
+            if status.is_client_error() && status.as_u16() != 429 {
+                " Check credentials and click Connect to authorize again."
+            } else {
+                " Background reconnects will continue."
+            }
+        );
+        return Err(if status.is_client_error() && status.as_u16() != 429 {
+            ConnectFailure::action(message)
+        } else {
+            ConnectFailure::retry(message)
+        });
+    }
+    response
         .json::<TokenResponse>()
-        .map_err(|error| error.to_string())
+        .map_err(|_| ConnectFailure::retry("Discord returned an invalid token response"))
 }
 
 fn own_channel_voice_state(channel: &Value, user_id: &str) -> Result<VoiceState, String> {
@@ -832,6 +814,103 @@ pub(crate) fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        fs::File,
+        io::{Read, Write},
+    };
+
+    #[test]
+    fn background_token_plans_never_open_authorization() {
+        let mut credentials = DiscordRpc::default();
+        assert_eq!(
+            token_plan(&credentials, false, false),
+            TokenPlan::NeedsAuthorization
+        );
+        assert_eq!(token_plan(&credentials, true, false), TokenPlan::Authorize);
+        credentials.access_token = Some("test-token".into());
+        credentials.token_expires_at = Some(now_ms() + 120_000);
+        assert_eq!(token_plan(&credentials, false, false), TokenPlan::Cached);
+        assert_eq!(
+            token_plan(&credentials, false, true),
+            TokenPlan::NeedsAuthorization
+        );
+        credentials.refresh_token = Some("test-refresh".into());
+        assert_eq!(token_plan(&credentials, false, true), TokenPlan::Refresh);
+        credentials.token_expires_at = Some(0);
+        assert_eq!(token_plan(&credentials, false, false), TokenPlan::Refresh);
+    }
+
+    #[test]
+    fn idle_ping_is_answered_without_voice_changes_or_sound() {
+        let mut rpc = scripted_rpc(&[
+            (3, json!({"ping": true})),
+            (1, json!({"evt": "VOICE_SETTINGS_UPDATE"})),
+        ]);
+        rpc.pipe.minimum_requests = 0;
+        rpc.poll_idle().unwrap();
+        assert_eq!(
+            decoded_frames(&rpc.pipe.outgoing),
+            vec![(4, json!({"ping": true}))]
+        );
+        assert_eq!(rpc.nonce, 0);
+        assert!(!rpc.broken);
+    }
+
+    #[test]
+    fn opaque_and_empty_ping_bodies_are_echoed_byte_for_byte() {
+        for body in [&b"not JSON\x00\xff"[..], &b""[..]] {
+            let mut incoming = 3_u32.to_le_bytes().to_vec();
+            incoming.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            incoming.extend_from_slice(body);
+            let mut rpc = scripted_rpc(&[]);
+            rpc.pipe.incoming = std::io::Cursor::new(incoming.clone());
+            rpc.pipe.minimum_requests = 0;
+            rpc.poll_idle().unwrap();
+            incoming[..4].copy_from_slice(&4_u32.to_le_bytes());
+            assert_eq!(rpc.pipe.outgoing, incoming);
+            assert!(!rpc.broken);
+        }
+    }
+
+    #[test]
+    fn idle_close_marks_the_transport_unusable() {
+        let mut rpc = scripted_rpc(&[(2, json!({"code": 1000}))]);
+        rpc.pipe.minimum_requests = 0;
+        assert!(rpc.poll_idle().is_err());
+        assert!(rpc.broken);
+    }
+
+    #[test]
+    fn unanswered_request_marks_the_transport_unusable() {
+        let mut rpc = scripted_rpc(&[]);
+        rpc.pipe.minimum_requests = 1;
+        assert!(rpc.request("GET_VOICE_SETTINGS", json!({})).is_err());
+        assert!(rpc.broken);
+    }
+
+    #[test]
+    fn sound_command_rejection_does_not_mark_a_healthy_pipe_broken() {
+        let mut rpc = scripted_rpc(&[(
+            1,
+            json!({"nonce": "1", "evt": "ERROR", "data": {"message": "Invalid Sound"}}),
+        )]);
+        rpc.pipe.minimum_requests = 1;
+        assert!(rpc.play_soundboard_sound("123").is_err());
+        assert!(!rpc.broken);
+    }
+
+    #[test]
+    fn heartbeat_only_reads_voice_settings() {
+        let mut rpc = scripted_rpc(&[(
+            1,
+            json!({"nonce": "1", "data": {"mute": false, "deaf": false}}),
+        )]);
+        rpc.pipe.minimum_requests = 1;
+        Connection::heartbeat(&mut rpc).unwrap();
+        let frames = decoded_frames(&rpc.pipe.outgoing);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].1["cmd"], "GET_VOICE_SETTINGS");
+    }
 
     const SOUNDBOARD_GUILD_ID: &str = "1539407179117760542";
 
@@ -889,6 +968,17 @@ mod tests {
         incoming: std::io::Cursor<Vec<u8>>,
         outgoing: Vec<u8>,
         minimum_requests: usize,
+    }
+
+    impl RpcTransport for TestPipe {
+        fn begin_exchange(&mut self, _: Duration) {}
+        fn available(&self) -> std::io::Result<usize> {
+            Ok(self
+                .incoming
+                .get_ref()
+                .len()
+                .saturating_sub(self.incoming.position() as usize))
+        }
     }
 
     impl Read for TestPipe {
@@ -954,6 +1044,7 @@ mod tests {
                 json!({ "sound_id": "123", "guild_id": "456" }),
             )]),
             user_id: None,
+            broken: false,
         }
     }
 
@@ -1544,6 +1635,7 @@ mod tests {
             nonce: 0,
             soundboard_args: HashMap::from([("123".into(), args.clone())]),
             user_id: None,
+            broken: false,
         };
         assert_eq!(rpc.prepare_soundboard_sound("123"), Ok(args));
         assert_eq!(rpc.nonce, 0);

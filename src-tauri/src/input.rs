@@ -40,6 +40,7 @@ pub struct CaptureResult {
 
 #[derive(Default)]
 struct Keys {
+    physical_down: HashSet<u32>,
     mods: HashSet<ModKey>,
     active: bool,
     hands_free_active: bool,
@@ -108,6 +109,7 @@ impl InputMonitor {
         if let Ok(mut keys) = self.shared.keys.lock() {
             keys.active = false;
             keys.hands_free_active = false;
+            keys.physical_down.clear();
             keys.mods.clear();
             keys.pressed_keys.clear();
             send_event(&self.shared.event_tx, InputEvent::Dismiss);
@@ -166,6 +168,28 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
 }
 
 fn handle_key(shared: &Shared, vk: u32, down: bool, injected: bool) {
+    handle_key_with_state(shared, vk, down, injected, physical_key_down);
+}
+
+fn physical_key_down(vk: u32) -> bool {
+    // Low-level hooks run before Windows updates the current event's async
+    // state. The event itself is applied separately below.
+    #[cfg(not(test))]
+    return unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(vk as i32) } < 0;
+    #[cfg(test)]
+    {
+        let _ = vk;
+        true // Unit tests supply explicit snapshots when simulating missed releases.
+    }
+}
+
+fn handle_key_with_state(
+    shared: &Shared,
+    vk: u32,
+    down: bool,
+    injected: bool,
+    is_down: impl Fn(u32) -> bool,
+) {
     // Dictation apps paste with synthetic modifiers, sometimes before the user
     // releases the other shortcut key. Those events must not alter physical state.
     if injected {
@@ -189,15 +213,34 @@ fn handle_key(shared: &Shared, vk: u32, down: bool, injected: bool) {
         Err(_) => return,
     };
 
+    // Remove missed key-ups, but never add keys from Windows' async state:
+    // synthetic input must not manufacture a physically observed shortcut.
+    keys.physical_down
+        .retain(|held| *held == vk || is_down(*held));
+    if down {
+        keys.physical_down.insert(vk);
+    } else {
+        keys.physical_down.remove(&vk);
+    }
+    keys.mods = keys
+        .physical_down
+        .iter()
+        .filter_map(|held| modifier_for(*held))
+        .collect();
+    keys.pressed_keys = keys
+        .physical_down
+        .iter()
+        .filter(|held| modifier_for(**held).is_none())
+        .map(|held| key_name(*held))
+        .collect();
+
     if capturing {
-        if let Some(modifier) = modifier {
+        if modifier.is_some() {
             if down {
-                keys.mods.insert(modifier);
                 let pressed = keys.mods.iter().copied().collect::<Vec<_>>();
                 keys.capture_peak.extend(pressed);
             } else if !keys.capture_peak.is_empty() {
                 let combo = shortcut_from(&keys.capture_peak, String::new());
-                keys.mods.remove(&modifier);
                 drop(keys);
                 finish_capture(shared, combo);
             }
@@ -215,29 +258,28 @@ fn handle_key(shared: &Shared, vk: u32, down: bool, injected: bool) {
         return;
     }
 
-    if let Some(modifier) = modifier {
-        if down {
-            keys.mods.insert(modifier);
-        } else {
-            keys.mods.remove(&modifier);
-        }
-    } else if down {
-        keys.pressed_keys.insert(key_name(vk));
-    } else {
-        keys.pressed_keys.remove(&key_name(vk));
-    }
-
     let config = shared.config.get();
     if config.dictation_app == DictationApp::Wispr && down && vk == VK_ESCAPE.0 as u32 {
         send_event(&shared.event_tx, InputEvent::Dismiss);
         return;
     }
-    evaluate_shortcuts(&mut keys, &config, &shared.event_tx);
+    evaluate_shortcuts_for_event(&mut keys, &config, &shared.event_tx, down);
 }
 
+#[cfg(test)]
 fn evaluate_shortcuts(keys: &mut Keys, config: &Config, event_tx: &mpsc::Sender<InputEvent>) {
+    evaluate_shortcuts_for_event(keys, config, event_tx, true);
+}
+
+fn evaluate_shortcuts_for_event(
+    keys: &mut Keys,
+    config: &Config,
+    event_tx: &mpsc::Sender<InputEvent>,
+    allow_start: bool,
+) {
     let required_down = shortcut_down(&config.shortcut, keys);
-    if required_down && exact_mods(&keys.mods, &config.shortcut.mods) && !keys.active {
+    if allow_start && required_down && exact_mods(&keys.mods, &config.shortcut.mods) && !keys.active
+    {
         keys.active = true;
         send_event(event_tx, InputEvent::Press);
     } else if keys.active && !required_down {
@@ -246,7 +288,8 @@ fn evaluate_shortcuts(keys: &mut Keys, config: &Config, event_tx: &mpsc::Sender<
     }
     if config.dictation_app == DictationApp::Wispr {
         let required_down = shortcut_down(&config.hands_free_shortcut, keys);
-        if required_down
+        if allow_start
+            && required_down
             && exact_mods(&keys.mods, &config.hands_free_shortcut.mods)
             && !keys.hands_free_active
         {
@@ -355,6 +398,109 @@ mod tests {
             },
             rx,
         )
+    }
+
+    #[test]
+    fn control_alone_never_starts_the_default_shortcut() {
+        let (shared, rx) = keyboard_test_shared();
+        handle_key(&shared, VK_LCONTROL.0 as u32, true, false);
+        handle_key(&shared, VK_LCONTROL.0 as u32, false, false);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn missed_windows_release_cannot_turn_control_into_a_shortcut() {
+        let (shared, rx) = keyboard_test_shared();
+        handle_key(&shared, VK_LCONTROL.0 as u32, true, false);
+        handle_key(&shared, VK_LWIN.0 as u32, true, false);
+        assert_eq!(rx.try_recv().unwrap(), InputEvent::Press);
+        handle_key(&shared, VK_LCONTROL.0 as u32, false, false);
+        assert_eq!(rx.try_recv().unwrap(), InputEvent::Release);
+        // Win was released but its hook event was missed.
+        handle_key_with_state(&shared, VK_LCONTROL.0 as u32, true, false, |_| false);
+        assert!(rx.try_recv().is_err());
+        assert!(!shared.keys.lock().unwrap().mods.contains(&ModKey::Cmd));
+        // A genuinely new Win press must still work while Ctrl is held.
+        handle_key_with_state(&shared, VK_LWIN.0 as u32, true, false, |_| true);
+        assert_eq!(rx.try_recv().unwrap(), InputEvent::Press);
+    }
+
+    #[test]
+    fn windows_async_state_cannot_add_an_unobserved_modifier() {
+        let (shared, rx) = keyboard_test_shared();
+        // Async state may contain injected keys; only observed physical downs
+        // can contribute to a new shortcut.
+        handle_key_with_state(&shared, VK_LCONTROL.0 as u32, true, false, |_| true);
+        assert!(rx.try_recv().is_err());
+        assert!(!shared.keys.lock().unwrap().mods.contains(&ModKey::Cmd));
+    }
+
+    #[test]
+    fn missed_releases_end_an_active_hold_on_the_next_physical_event() {
+        let (shared, rx) = keyboard_test_shared();
+        handle_key(&shared, VK_LCONTROL.0 as u32, true, false);
+        handle_key(&shared, VK_LWIN.0 as u32, true, false);
+        assert_eq!(rx.try_recv().unwrap(), InputEvent::Press);
+        handle_key_with_state(&shared, VK_LCONTROL.0 as u32, true, false, |_| false);
+        assert_eq!(rx.try_recv().unwrap(), InputEvent::Release);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn releasing_one_side_does_not_forget_the_other_control_key() {
+        let (shared, rx) = keyboard_test_shared();
+        handle_key(&shared, VK_LCONTROL.0 as u32, true, false);
+        handle_key(&shared, VK_RCONTROL.0 as u32, true, false);
+        handle_key(&shared, VK_LWIN.0 as u32, true, false);
+        assert_eq!(rx.try_recv().unwrap(), InputEvent::Press);
+        handle_key(&shared, VK_LCONTROL.0 as u32, false, false);
+        assert!(rx.try_recv().is_err());
+        handle_key(&shared, VK_RCONTROL.0 as u32, false, false);
+        assert_eq!(rx.try_recv().unwrap(), InputEvent::Release);
+    }
+
+    #[test]
+    fn missed_nonmodifier_release_cannot_complete_a_custom_shortcut() {
+        let (mut shared, rx) = keyboard_test_shared();
+        let path = std::env::temp_dir().join(format!(
+            "bridge-custom-input-{}.json",
+            crate::discord::now_ms()
+        ));
+        shared.config = Arc::new(ConfigStore::load(path.clone()));
+        let mut config = shared.config.get();
+        config.shortcut = Shortcut {
+            mods: vec![Mod::Ctrl],
+            key: "F8".into(),
+        };
+        shared.config.replace_public(config).unwrap();
+        handle_key(&shared, 0x77, true, false);
+        handle_key_with_state(&shared, VK_LCONTROL.0 as u32, true, false, |_| false);
+        assert!(rx.try_recv().is_err());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn capture_key_releases_do_not_leave_windows_stuck() {
+        let (shared, events) = keyboard_test_shared();
+        let (tx, captured) = mpsc::channel();
+        *shared.capture.lock().unwrap() = Some(tx);
+        handle_key(&shared, VK_LCONTROL.0 as u32, true, false);
+        handle_key(&shared, VK_LWIN.0 as u32, true, false);
+        handle_key(&shared, VK_LCONTROL.0 as u32, false, false);
+        assert_eq!(captured.try_recv().unwrap().mods, vec![Mod::Ctrl, Mod::Cmd]);
+        handle_key(&shared, VK_LWIN.0 as u32, false, false);
+        handle_key(&shared, VK_LCONTROL.0 as u32, true, false);
+        assert!(events.try_recv().is_err());
+    }
+
+    #[test]
+    fn keyup_cannot_start_a_shortcut_when_an_extra_modifier_is_released() {
+        let (shared, events) = keyboard_test_shared();
+        handle_key(&shared, VK_LSHIFT.0 as u32, true, false);
+        handle_key(&shared, VK_LCONTROL.0 as u32, true, false);
+        handle_key(&shared, VK_LWIN.0 as u32, true, false);
+        handle_key(&shared, VK_LSHIFT.0 as u32, false, false);
+        assert!(events.try_recv().is_err());
     }
 
     #[test]
