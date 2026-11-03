@@ -36,6 +36,14 @@ declare global {
 const invoke = window.__TAURI__.core.invoke;
 const MOD_ORDER: Mod[] = ['ctrl', 'alt', 'cmd', 'shift'];
 const MOD_LABEL: Record<Mod, string> = { ctrl: 'Ctrl', alt: 'Alt', cmd: 'Win', shift: 'Shift' };
+const KEY_LABELS: Record<string, string> = {
+  VK_20: 'Space', VK_C0: '` (Backtick)', VK_BD: '-', VK_BB: '=',
+  VK_DB: '[', VK_DD: ']', VK_DC: '\\', VK_BA: ';', VK_DE: "'",
+  VK_BC: ',', VK_BE: '.', VK_BF: '/', VK_9: 'Tab', VK_D: 'Enter',
+  VK_8: 'Backspace', VK_2E: 'Delete', VK_24: 'Home', VK_23: 'End',
+  VK_21: 'Page Up', VK_22: 'Page Down', VK_25: 'Left', VK_26: 'Up',
+  VK_27: 'Right', VK_28: 'Down',
+};
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
 
 const elements = {
@@ -71,7 +79,7 @@ let saveQueue = Promise.resolve();
 
 function comboLabel(combo: Shortcut): string {
   const parts = MOD_ORDER.filter((mod) => combo.mods.includes(mod)).map((mod) => MOD_LABEL[mod]);
-  if (combo.key) parts.push(combo.key === 'VK_20' ? 'Space' : combo.key.toUpperCase());
+  if (combo.key) parts.push(KEY_LABELS[combo.key] ?? combo.key.toUpperCase());
   return parts.join(' + ') || 'Not set';
 }
 
@@ -175,6 +183,68 @@ async function captureShortcut(field: 'shortcut' | 'handsFreeShortcut', button: 
     render();
   }
 }
+
+// A picker avoids invoking another app's shortcut while configuring the bridge.
+function addShortcutPicker(field: 'shortcut' | 'handsFreeShortcut', button: HTMLButtonElement): void {
+  const details = document.createElement('details');
+  details.className = 'shortcut-picker';
+  const summary = document.createElement('summary');
+  summary.textContent = 'Choose keys manually';
+  details.append(summary);
+  const controls = document.createElement('div');
+  controls.className = 'shortcut-controls';
+  const modifiers = MOD_ORDER.map((mod) => {
+    const label = document.createElement('label');
+    const checkbox = document.createElement('input');
+    checkbox.type = 'checkbox';
+    label.append(checkbox, MOD_LABEL[mod]);
+    controls.append(label);
+    return { mod, checkbox };
+  });
+  const key = document.createElement('select');
+  key.setAttribute('aria-label', `${field === 'shortcut' ? 'Dictation' : 'Hands-free'} key`);
+  const choices = ['', ...'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789', ...Array.from({ length: 24 }, (_, i) => `F${i + 1}`), ...Object.keys(KEY_LABELS)];
+  for (const value of choices) key.add(new Option(KEY_LABELS[value] ?? (value || 'Modifiers only'), value));
+  const apply = document.createElement('button');
+  apply.type = 'button';
+  apply.textContent = 'Apply';
+  apply.addEventListener('click', async () => {
+    if (capturing) return;
+    const mods = modifiers.filter(({ checkbox }) => checkbox.checked).map(({ mod }) => mod);
+    if (!mods.length && !key.value) {
+      showError('Choose at least one key or modifier.');
+      return;
+    }
+    apply.disabled = true;
+    const previous = structuredClone(config[field]);
+    config[field] = { mods, key: key.value };
+    try {
+      if (await save()) details.open = false;
+      else config[field] = previous;
+    } catch (error) {
+      config[field] = previous;
+      showError(String(error));
+    } finally {
+      apply.disabled = false;
+    }
+    render();
+  });
+  details.addEventListener('toggle', () => {
+    if (!details.open) return;
+    for (const { mod, checkbox } of modifiers) checkbox.checked = config[field].mods.includes(mod);
+    // Preserve less common captured VK codes when editing only modifiers.
+    if (!Array.from(key.options).some((option) => option.value === config[field].key)) {
+      key.add(new Option(config[field].key, config[field].key));
+    }
+    key.value = config[field].key;
+  });
+  controls.append(key, apply);
+  details.append(controls);
+  button.closest('.binding')!.after(details);
+}
+
+addShortcutPicker('shortcut', elements.capture);
+addShortcutPicker('handsFreeShortcut', elements.captureHandsFree);
 
 elements.capture.addEventListener('click', () => { void captureShortcut('shortcut', elements.capture); });
 elements.captureHandsFree.addEventListener('click', () => { void captureShortcut('handsFreeShortcut', elements.captureHandsFree); });
