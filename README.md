@@ -44,6 +44,10 @@ The settings window uses the WebView2 runtime already supplied by modern Windows
 
 The Rust backend observes the same physical keyboard shortcuts as your selected dictation app using `WH_KEYBOARD_LL`, mirrors its hold/double-tap/hands-free gestures, and writes Discord voice settings through Discord desktop's local named pipe. Injected keystrokes (including software macros and dictation paste shortcuts) are ignored. It does not read speech or typed text.
 
+Some dictation apps consume their shortcut before older keyboard hooks receive it. The bridge refreshes its observer when shortcut recording starts and after a new physical modifier press, so modifier-first chords such as Ctrl + backtick can be observed before the dictation app handles the next key. It still passes every event onward and preserves the downstream hook's return value; it does not change dictation-app settings. Consumed presses are tracked until release because Windows' asynchronous key state may never register them.
+
+Hook order is not a Windows delivery guarantee: another app can install a newer hook mid-gesture, and a consumed initial modifier or bare key can still be missed. Manual selection configures the chord but does not bypass this limitation. No timer continually reinstalls the hook.
+
 The tray process starts without a webview. Tauri creates the settings webview only when requested and destroys it when closed, keeping normal background usage small.
 
 ## Connection recovery

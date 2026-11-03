@@ -1,6 +1,7 @@
 use crate::config::{Config, ConfigStore, DictationApp, Mod, Shortcut};
 use serde::Serialize;
 use std::{
+    cell::Cell,
     collections::HashSet,
     sync::{Arc, Mutex, OnceLock, mpsc},
     thread,
@@ -8,16 +9,17 @@ use std::{
 };
 use windows::Win32::{
     Foundation::{HINSTANCE, LPARAM, LRESULT, WPARAM},
-    System::LibraryLoader::GetModuleHandleW,
+    System::{LibraryLoader::GetModuleHandleW, Threading::GetCurrentThreadId},
     UI::{
         Input::KeyboardAndMouse::{
             VK_CONTROL, VK_ESCAPE, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU, VK_RCONTROL,
             VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SHIFT,
         },
         WindowsAndMessaging::{
-            CallNextHookEx, DispatchMessageW, GetMessageW, HC_ACTION, KBDLLHOOKSTRUCT,
-            LLKHF_INJECTED, MSG, SetWindowsHookExW, TranslateMessage, WH_KEYBOARD_LL, WM_KEYDOWN,
-            WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
+            CallNextHookEx, DispatchMessageW, GetMessageW, HC_ACTION, HHOOK, KBDLLHOOKSTRUCT,
+            LLKHF_INJECTED, MSG, PM_NOREMOVE, PeekMessageW, PostThreadMessageW, SetWindowsHookExW,
+            TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL, WM_APP, WM_KEYDOWN, WM_KEYUP,
+            WM_SYSKEYDOWN, WM_SYSKEYUP,
         },
     },
 };
@@ -41,6 +43,7 @@ pub struct CaptureResult {
 #[derive(Default)]
 struct Keys {
     physical_down: HashSet<u32>,
+    consumed_down: HashSet<u32>,
     mods: HashSet<ModKey>,
     active: bool,
     hands_free_active: bool,
@@ -64,9 +67,39 @@ struct Shared {
 }
 
 static SHARED: OnceLock<Arc<Shared>> = OnceLock::new();
+const REFRESH_HOOK: u32 = WM_APP + 1;
+type RefreshReply = mpsc::Sender<Result<(), String>>;
+thread_local! {
+    // Owned and replaced only by the thread that pumps this hook's messages.
+    static HOOK: Cell<Option<HHOOK>> = const { Cell::new(None) };
+}
+
+fn refresh_hook() -> Result<(), String> {
+    unsafe {
+        let module = GetModuleHandleW(None).map_err(|e| e.to_string())?;
+        let next = SetWindowsHookExW(
+            WH_KEYBOARD_LL,
+            Some(keyboard_proc),
+            Some(HINSTANCE(module.0)),
+            0,
+        )
+        .map_err(|e| e.to_string())?;
+        // Install first: a failed installation must not remove the working hook.
+        if let Some(previous) = HOOK.with(Cell::get) {
+            if let Err(error) = UnhookWindowsHookEx(previous) {
+                let _ = UnhookWindowsHookEx(next);
+                return Err(error.to_string());
+            }
+        }
+        HOOK.with(|slot| slot.set(Some(next)));
+        Ok(())
+    }
+}
 
 pub struct InputMonitor {
     shared: Arc<Shared>,
+    hook_thread: u32,
+    refresh_tx: mpsc::Sender<RefreshReply>,
 }
 
 impl InputMonitor {
@@ -83,26 +116,53 @@ impl InputMonitor {
         SHARED
             .set(shared.clone())
             .map_err(|_| "Keyboard monitor already started")?;
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (refresh_tx, refresh_rx) = mpsc::channel::<RefreshReply>();
         thread::Builder::new()
             .name("dictation-keyboard-hook".into())
-            .spawn(|| unsafe {
-                let module = GetModuleHandleW(None).unwrap_or_default();
-                let hook = SetWindowsHookExW(
-                    WH_KEYBOARD_LL,
-                    Some(keyboard_proc),
-                    Some(HINSTANCE(module.0)),
-                    0,
-                )
-                .expect("failed to install keyboard hook");
+            .spawn(move || unsafe {
                 let mut message = MSG::default();
-                while GetMessageW(&mut message, None, 0, 0).as_bool() {
-                    let _ = TranslateMessage(&message);
-                    DispatchMessageW(&message);
+                // Create the queue before publishing the thread ID to capture().
+                let _ = PeekMessageW(&mut message, None, 0, 0, PM_NOREMOVE);
+                if let Err(error) = refresh_hook() {
+                    let _ = ready_tx.send(Err(error));
+                    return;
                 }
-                let _ = windows::Win32::UI::WindowsAndMessaging::UnhookWindowsHookEx(hook);
+                let _ = ready_tx.send(Ok(GetCurrentThreadId()));
+                while GetMessageW(&mut message, None, 0, 0).0 > 0 {
+                    if message.message == REFRESH_HOOK {
+                        for reply in refresh_rx.try_iter() {
+                            let _ = reply.send(refresh_hook());
+                        }
+                    } else {
+                        let _ = TranslateMessage(&message);
+                        DispatchMessageW(&message);
+                    }
+                }
+                if let Some(hook) = HOOK.with(|slot| slot.take()) {
+                    let _ = UnhookWindowsHookEx(hook);
+                }
             })
             .map_err(|error| error.to_string())?;
-        Ok(Self { shared })
+        let hook_thread = ready_rx
+            .recv()
+            .map_err(|_| "Keyboard listener stopped during initialization".to_string())??;
+        Ok(Self {
+            shared,
+            hook_thread,
+            refresh_tx,
+        })
+    }
+
+    fn refresh_for_capture(&self) -> Result<(), String> {
+        let (tx, rx) = mpsc::channel();
+        self.refresh_tx
+            .send(tx)
+            .map_err(|_| "Keyboard listener has stopped".to_string())?;
+        unsafe { PostThreadMessageW(self.hook_thread, REFRESH_HOOK, WPARAM(0), LPARAM(0)) }
+            .map_err(|e| e.to_string())?;
+        rx.recv_timeout(Duration::from_secs(2))
+            .map_err(|_| "Keyboard listener did not respond".to_string())?
     }
 
     pub fn reset_gesture(&self) {
@@ -110,6 +170,7 @@ impl InputMonitor {
             keys.active = false;
             keys.hands_free_active = false;
             keys.physical_down.clear();
+            keys.consumed_down.clear();
             keys.mods.clear();
             keys.pressed_keys.clear();
             send_event(&self.shared.event_tx, InputEvent::Dismiss);
@@ -117,6 +178,12 @@ impl InputMonitor {
     }
 
     pub fn capture(&self) -> CaptureResult {
+        if let Err(error) = self.refresh_for_capture() {
+            return CaptureResult {
+                combo: None,
+                reason: Some(error),
+            };
+        }
         let (tx, rx) = mpsc::channel();
         match self.shared.capture.lock() {
             Ok(mut slot) if slot.is_none() => *slot = Some(tx),
@@ -149,22 +216,46 @@ impl InputMonitor {
 }
 
 unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    if code == HC_ACTION as i32 {
-        if let Some(shared) = SHARED.get() {
-            let event = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
-            let down = wparam.0 == WM_KEYDOWN as usize || wparam.0 == WM_SYSKEYDOWN as usize;
-            let up = wparam.0 == WM_KEYUP as usize || wparam.0 == WM_SYSKEYUP as usize;
-            if down || up {
-                handle_key(
-                    shared,
-                    event.vkCode,
-                    down,
-                    event.flags.contains(LLKHF_INJECTED),
-                );
+    if code != HC_ACTION as i32 {
+        return unsafe { CallNextHookEx(None, code, wparam, lparam) };
+    }
+    let Some(shared) = SHARED.get() else {
+        return unsafe { CallNextHookEx(None, code, wparam, lparam) };
+    };
+    let event = unsafe { *(lparam.0 as *const KBDLLHOOKSTRUCT) };
+    let down = wparam.0 == WM_KEYDOWN as usize || wparam.0 == WM_SYSKEYDOWN as usize;
+    let up = wparam.0 == WM_KEYUP as usize || wparam.0 == WM_SYSKEYUP as usize;
+    let injected = event.flags.contains(LLKHF_INJECTED);
+    let renew = shared
+        .keys
+        .lock()
+        .map(|keys| starts_modifier_press(&keys, event.vkCode, down, injected))
+        .unwrap_or(false);
+    if down || up {
+        handle_key(shared, event.vkCode, down, injected);
+    }
+    // Always preserve downstream behavior. In particular, Flow must still see
+    // and consume its own shortcut. We observe it rather than reserve/block it.
+    let next = unsafe { CallNextHookEx(None, code, wparam, lparam) };
+    if down && !injected && next.0 != 0 {
+        if let Ok(mut keys) = shared.keys.lock() {
+            if keys.physical_down.contains(&event.vkCode) {
+                keys.consumed_down.insert(event.vkCode);
             }
         }
     }
-    unsafe { CallNextHookEx(None, code, wparam, lparam) }
+    // Reclaim observation order after downstream processing of the modifier,
+    // before the following key arrives. No timer or third-party process changes.
+    if renew {
+        if let Err(error) = refresh_hook() {
+            eprintln!("Could not refresh keyboard listener: {error}");
+        }
+    }
+    next
+}
+
+fn starts_modifier_press(keys: &Keys, vk: u32, down: bool, injected: bool) -> bool {
+    down && !injected && modifier_for(vk).is_some() && !keys.physical_down.contains(&vk)
 }
 
 fn handle_key(shared: &Shared, vk: u32, down: bool, injected: bool) {
@@ -215,12 +306,22 @@ fn handle_key_with_state(
 
     // Remove missed key-ups, but never add keys from Windows' async state:
     // synthetic input must not manufacture a physically observed shortcut.
+    // A swallowed press never reaches Windows' async key state. Preserve that
+    // physical observation until key-up instead of releasing it on the next key.
+    let consumed = keys.consumed_down.clone();
     keys.physical_down
-        .retain(|held| *held == vk || is_down(*held));
+        .retain(|held| *held == vk || consumed.contains(held) || is_down(*held));
     if down {
         keys.physical_down.insert(vk);
     } else {
         keys.physical_down.remove(&vk);
+        keys.consumed_down.remove(&vk);
+        if modifier.is_some() {
+            // Once the chord breaks, don't let a missed release of a consumed
+            // key manufacture a new chord on the next modifier press.
+            let consumed = std::mem::take(&mut keys.consumed_down);
+            keys.physical_down.retain(|held| !consumed.contains(held));
+        }
     }
     keys.mods = keys
         .physical_down
@@ -401,6 +502,100 @@ mod tests {
     }
 
     #[test]
+    fn only_new_physical_modifier_presses_refresh_the_hook() {
+        let mut keys = Keys::default();
+        let ctrl = VK_LCONTROL.0 as u32;
+        assert!(starts_modifier_press(&keys, ctrl, true, false));
+        assert!(!starts_modifier_press(&keys, ctrl, false, false));
+        assert!(!starts_modifier_press(&keys, ctrl, true, true));
+        assert!(!starts_modifier_press(&keys, 0xC0, true, false));
+        keys.physical_down.insert(ctrl);
+        assert!(!starts_modifier_press(&keys, ctrl, true, false));
+        assert!(starts_modifier_press(
+            &keys,
+            VK_RCONTROL.0 as u32,
+            true,
+            false
+        ));
+    }
+
+    fn swallowed_backtick_shared() -> (Shared, mpsc::Receiver<InputEvent>, std::path::PathBuf) {
+        let (shared, events) = keyboard_test_shared();
+        let path = std::env::temp_dir().join(format!(
+            "bridge-swallowed-{}.json",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let shared = Shared {
+            config: Arc::new(ConfigStore::load(path.clone())),
+            ..shared
+        };
+        let mut config = shared.config.get();
+        config.dictation_app = DictationApp::Wispr;
+        config.shortcut = Shortcut {
+            mods: vec![Mod::Ctrl],
+            key: "VK_C0".into(),
+        };
+        shared.config.replace_public(config).unwrap();
+        handle_key(&shared, VK_LCONTROL.0 as u32, true, false);
+        handle_key(&shared, 0xC0, true, false);
+        assert_eq!(events.try_recv().unwrap(), InputEvent::Press);
+        shared.keys.lock().unwrap().consumed_down.insert(0xC0);
+        (shared, events, path)
+    }
+
+    #[test]
+    fn consumed_press_survives_false_async_state_and_injected_release() {
+        let (shared, events, path) = swallowed_backtick_shared();
+        // Windows never registers the consumed backtick-down. An unrelated
+        // physical event must not turn that false async snapshot into a release.
+        handle_key_with_state(&shared, 0x41, true, false, |vk| vk != 0xC0);
+        handle_key_with_state(&shared, 0xC0, false, true, |_| false);
+        assert!(events.try_recv().is_err());
+        assert!(shared.keys.lock().unwrap().physical_down.contains(&0xC0));
+        handle_key_with_state(&shared, 0xC0, false, false, |_| true);
+        assert_eq!(events.try_recv().unwrap(), InputEvent::Release);
+        assert!(shared.keys.lock().unwrap().consumed_down.is_empty());
+        handle_key(&shared, VK_LCONTROL.0 as u32, false, false);
+        assert!(events.try_recv().is_err());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn modifier_release_clears_a_consumed_key_with_a_missing_release() {
+        let (shared, events, path) = swallowed_backtick_shared();
+        handle_key_with_state(&shared, VK_LCONTROL.0 as u32, false, false, |_| false);
+        assert_eq!(events.try_recv().unwrap(), InputEvent::Release);
+        assert!(shared.keys.lock().unwrap().consumed_down.is_empty());
+        handle_key_with_state(&shared, VK_LCONTROL.0 as u32, true, false, |_| false);
+        assert!(events.try_recv().is_err());
+        handle_key(&shared, 0xC0, true, false);
+        assert_eq!(events.try_recv().unwrap(), InputEvent::Press);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn hook_thread_is_ready_before_start_returns_and_accepts_refresh() {
+        let (shared, _) = keyboard_test_shared();
+        let (tx, _events) = mpsc::channel();
+        let monitor = InputMonitor::start(shared.config, tx).unwrap();
+        monitor.refresh_for_capture().unwrap();
+        monitor.refresh_for_capture().unwrap();
+        // End this test's message loop, which unregisters its current hook.
+        unsafe {
+            PostThreadMessageW(
+                monitor.hook_thread,
+                windows::Win32::UI::WindowsAndMessaging::WM_QUIT,
+                WPARAM(0),
+                LPARAM(0),
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
     fn control_backtick_capture_keeps_the_oem_key_and_modifier() {
         let (shared, events) = keyboard_test_shared();
         let (tx, captured) = mpsc::channel();
@@ -419,11 +614,15 @@ mod tests {
     fn manually_selected_control_backtick_activates_and_releases() {
         let config = Config {
             dictation_app: DictationApp::Wispr,
-            shortcut: Shortcut { mods: vec![Mod::Ctrl], key: "VK_C0".into() },
+            shortcut: Shortcut {
+                mods: vec![Mod::Ctrl],
+                key: "VK_C0".into(),
+            },
             ..Config::default()
         };
         // Exercise the same JSON representation saved by the manual picker.
-        let config: Config = serde_json::from_str(&serde_json::to_string(&config).unwrap()).unwrap();
+        let config: Config =
+            serde_json::from_str(&serde_json::to_string(&config).unwrap()).unwrap();
         config.validate().unwrap();
         let (tx, rx) = mpsc::channel();
         let mut keys = Keys::default();
