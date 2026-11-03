@@ -276,3 +276,10 @@ input[type=checkbox] { width: 17px; height: 17px; accent-color: var(--primary); 
   font-size: 12px;
   opacity: 0.45;
 }
+
+/* Manual shortcut fallback when another app intercepts recording. */
+.shortcut-picker { margin: 0 0 12px; }
+.shortcut-picker summary { cursor: pointer; color: var(--muted); font-size: 12px; }
+.shortcut-controls { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; padding-top: 10px; }
+.shortcut-controls label { display: flex; gap: 4px; align-items: center; }
+.shortcut-controls select { background: var(--surface); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 6px; }

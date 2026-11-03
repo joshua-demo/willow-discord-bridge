@@ -401,6 +401,47 @@ mod tests {
     }
 
     #[test]
+    fn control_backtick_capture_keeps_the_oem_key_and_modifier() {
+        let (shared, events) = keyboard_test_shared();
+        let (tx, captured) = mpsc::channel();
+        *shared.capture.lock().unwrap() = Some(tx);
+        handle_key(&shared, VK_LCONTROL.0 as u32, true, false);
+        handle_key(&shared, 0xC0, true, false);
+        let combo = captured.try_recv().unwrap();
+        assert_eq!(combo.mods, vec![Mod::Ctrl]);
+        assert_eq!(combo.key, "VK_C0");
+        handle_key(&shared, 0xC0, false, false);
+        handle_key(&shared, VK_LCONTROL.0 as u32, false, false);
+        assert!(events.try_recv().is_err());
+    }
+
+    #[test]
+    fn manually_selected_control_backtick_activates_and_releases() {
+        let config = Config {
+            dictation_app: DictationApp::Wispr,
+            shortcut: Shortcut { mods: vec![Mod::Ctrl], key: "VK_C0".into() },
+            ..Config::default()
+        };
+        // Exercise the same JSON representation saved by the manual picker.
+        let config: Config = serde_json::from_str(&serde_json::to_string(&config).unwrap()).unwrap();
+        config.validate().unwrap();
+        let (tx, rx) = mpsc::channel();
+        let mut keys = Keys::default();
+        keys.mods.insert(ModKey::Ctrl);
+        evaluate_shortcuts(&mut keys, &config, &tx);
+        assert!(rx.try_recv().is_err());
+        keys.pressed_keys.insert(key_name(0xC0));
+        evaluate_shortcuts(&mut keys, &config, &tx);
+        assert_eq!(rx.try_recv().unwrap(), InputEvent::Press);
+        evaluate_shortcuts(&mut keys, &config, &tx);
+        assert!(rx.try_recv().is_err());
+        keys.pressed_keys.clear();
+        evaluate_shortcuts_for_event(&mut keys, &config, &tx, false);
+        assert_eq!(rx.try_recv().unwrap(), InputEvent::Release);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
     fn control_alone_never_starts_the_default_shortcut() {
         let (shared, rx) = keyboard_test_shared();
         handle_key(&shared, VK_LCONTROL.0 as u32, true, false);

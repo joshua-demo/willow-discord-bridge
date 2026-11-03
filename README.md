@@ -151,3 +151,7 @@ Use `npm version patch`, `npm version minor`, or `npm version major`, then push 
 This project contains work adapted from [Hush](https://github.com/MatthysDev/hush), created by [Matthys Ducrocq](https://github.com/MatthysDev). Hush established the core design of observing an existing dictation shortcut and controlling Discord through local RPC instead of injected keyboard events.
 
 The upstream MIT notice is retained verbatim in `LICENSE`. See `NOTICE` for adaptation details and `UPSTREAM_README.md` for the preserved upstream documentation.
+
+### When shortcut recording does not recognize a key
+
+Use **Choose keys manually** below Dictation or Hands-free, select the modifiers and key, then click **Apply**. For Ctrl + backtick (the key above Tab on a US keyboard), select **Ctrl** and **` (Backtick)**. This saves the same shortcut format as recording, without pressing the combination and triggering the dictation app. The bridge must match the shortcut configured in your dictation app.
